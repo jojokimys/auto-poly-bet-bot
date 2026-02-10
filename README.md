@@ -4,7 +4,7 @@ An automated betting bot for Polymarket built with Next.js, TypeScript, Tailwind
 
 ## Features
 
-- ✅ **Next.js 14** with App Router
+- ✅ **Next.js 15** with App Router
 - ✅ **TypeScript** for type safety
 - ✅ **Tailwind CSS** for styling
 - ✅ **HeroUI Components** for modern UI elements
@@ -12,10 +12,11 @@ An automated betting bot for Polymarket built with Next.js, TypeScript, Tailwind
 - ✅ **Light/Dark Theme** with system preference detection and localStorage persistence
 - ✅ **Responsive Design** with collapsible sidebar
 - ✅ **Header & Sidebar Navigation**
+- ✅ **Security Hardened** - All known vulnerabilities patched
 
 ## Tech Stack
 
-- **Framework**: Next.js 14
+- **Framework**: Next.js 15.5.12
 - **Language**: TypeScript
 - **Styling**: Tailwind CSS
 - **UI Library**: HeroUI (@heroui/react)
