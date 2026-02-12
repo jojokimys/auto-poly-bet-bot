@@ -2,6 +2,7 @@
 
 import { useAppStore } from '@/store/useAppStore';
 import { Button } from '@heroui/react';
+import { ConnectionStatus } from './ConnectionStatus';
 
 export function Header() {
   const theme = useAppStore((state) => state.theme);
@@ -38,6 +39,7 @@ export function Header() {
         </div>
 
         <div className="flex items-center space-x-4">
+          <ConnectionStatus />
           <Button
             isIconOnly
             variant="light"

@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Market {
+  id          String   @id @default(cuid())
+  conditionId String   @unique
+  question    String
+  slug        String
+  endDate     String
+  active      Boolean  @default(true)
+  closed      Boolean  @default(false)
+  liquidity   Float    @default(0)
+  volume      Float    @default(0)
+  image       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  outcomes  Outcome[]
+  orders    Order[]
+  snapshots MarketSnapshot[]
+}
+
+model Outcome {
+  id       String @id @default(cuid())
+  marketId String
+  name     String
+  tokenId  String
+  price    Float  @default(0)
+
+  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, name])
+}
+
+model Order {
+  id          String   @id @default(cuid())
+  externalId  String?  @unique
+  marketId    String
+  tokenId     String
+  side        String
+  price       Float
+  size        Float
+  sizeMatched Float    @default(0)
+  status      String   @default("OPEN")
+  type        String   @default("LIMIT")
+  outcome     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  market Market  @relation(fields: [marketId], references: [id])
+  trades Trade[]
+}
+
+model Trade {
+  id         String   @id @default(cuid())
+  externalId String?  @unique
+  orderId    String
+  price      Float
+  size       Float
+  fee        Float    @default(0)
+  matchTime  DateTime
+  createdAt  DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+model BotSettings {
+  id                  String  @id @default("default")
+  // Wallet (encrypted at rest in production)
+  privateKey          String  @default("")
+  funderAddress       String  @default("")
+  // API credentials
+  apiKey              String  @default("")
+  apiSecret           String  @default("")
+  apiPassphrase       String  @default("")
+  // Bot config
+  maxBetAmount        Float   @default(10)
+  minLiquidity        Float   @default(1000)
+  minVolume           Float   @default(5000)
+  maxSpread           Float   @default(0.05)
+  autoBettingEnabled  Boolean @default(false)
+  scanIntervalMinutes Int     @default(5)
+
+  updatedAt DateTime @updatedAt
+}
+
+model MarketSnapshot {
+  id          String   @id @default(cuid())
+  marketId    String
+  yesPrice    Float
+  noPrice     Float
+  volume24hr  Float    @default(0)
+  spread      Float    @default(0)
+  liquidity   Float    @default(0)
+  snapshotAt  DateTime @default(now())
+
+  market Market @relation(fields: [marketId], references: [id])
+
+  @@index([marketId, snapshotAt])
+}
+
+model BotLog {
+  id        String   @id @default(cuid())
+  level     String   // info, warn, error, trade
+  event     String   // scan, signal, order, risk, start, stop, error
+  message   String
+  data      String?  // JSON blob for structured metadata
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([event])
+}

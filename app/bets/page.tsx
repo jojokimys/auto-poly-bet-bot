@@ -1,50 +1,98 @@
-import { Card, CardBody, CardHeader } from '@heroui/react';
+'use client';
+
+import { useEffect } from 'react';
+import { Card, CardBody, CardHeader, Input, Spinner } from '@heroui/react';
+import { MarketCard } from '@/components/MarketCard';
+import { MarketDetail } from '@/components/MarketDetail';
+import { useMarketStore } from '@/store/useMarketStore';
 
 export default function BetsPage() {
+  const {
+    loading,
+    error,
+    searchQuery,
+    selectedMarket,
+    fetchMarkets,
+    setSearchQuery,
+    setSelectedMarket,
+    filteredMarkets,
+  } = useMarketStore();
+
+  useEffect(() => {
+    fetchMarkets(100);
+  }, [fetchMarkets]);
+
+  const markets = filteredMarkets();
+
   return (
     <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <h2 className="text-2xl font-bold">Bets</h2>
-        </CardHeader>
-        <CardBody>
-          <p className="text-gray-600 dark:text-gray-400">
-            View and manage your bets here.
-          </p>
-        </CardBody>
-      </Card>
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Markets</h2>
+      </div>
 
-      <Card>
-        <CardBody>
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-              <thead className="bg-gray-50 dark:bg-gray-900">
-                <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    ID
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Market
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Amount
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Status
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                <tr>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400 text-center" colSpan={4}>
-                    No bets found
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </CardBody>
-      </Card>
+      <Input
+        placeholder="Search markets..."
+        value={searchQuery}
+        onValueChange={setSearchQuery}
+        size="lg"
+        variant="bordered"
+        startContent={
+          <svg className="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+        }
+      />
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2 space-y-4">
+          {loading ? (
+            <div className="flex justify-center py-12">
+              <Spinner size="lg" />
+            </div>
+          ) : error ? (
+            <Card>
+              <CardBody>
+                <p className="text-danger">{error}</p>
+              </CardBody>
+            </Card>
+          ) : markets.length === 0 ? (
+            <Card>
+              <CardBody>
+                <p className="text-gray-500">
+                  {searchQuery ? 'No markets match your search' : 'No active markets found'}
+                </p>
+              </CardBody>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {markets.map((market) => (
+                <MarketCard
+                  key={market.conditionId}
+                  market={market}
+                  onClick={setSelectedMarket}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="lg:col-span-1">
+          {selectedMarket ? (
+            <MarketDetail market={selectedMarket} />
+          ) : (
+            <Card>
+              <CardHeader>
+                <h3 className="text-lg font-semibold">Market Detail</h3>
+              </CardHeader>
+              <CardBody>
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  Click a market to view details and place orders.
+                </p>
+              </CardBody>
+            </Card>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
