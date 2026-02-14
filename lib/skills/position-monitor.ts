@@ -16,6 +16,7 @@ async function loadProfile(profileId: string): Promise<ProfileCredentials | null
     name: p.name,
     privateKey: p.privateKey,
     funderAddress: p.funderAddress,
+    signatureType: p.signatureType,
     apiKey: p.apiKey,
     apiSecret: p.apiSecret,
     apiPassphrase: p.apiPassphrase,

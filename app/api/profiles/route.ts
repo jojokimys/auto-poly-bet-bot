@@ -6,6 +6,7 @@ const createProfileSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   privateKey: z.string().min(1, 'Private key is required'),
   funderAddress: z.string().optional().default(''),
+  signatureType: z.number().int().min(0).max(2).optional().default(2),
   apiKey: z.string().min(1, 'API key is required'),
   apiSecret: z.string().min(1, 'API secret is required'),
   apiPassphrase: z.string().min(1, 'API passphrase is required'),

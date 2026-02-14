@@ -254,6 +254,7 @@ async function loadAllProfileCredentials(): Promise<ProfileCredentials[]> {
     name: p.name,
     privateKey: p.privateKey,
     funderAddress: p.funderAddress,
+    signatureType: p.signatureType,
     apiKey: p.apiKey,
     apiSecret: p.apiSecret,
     apiPassphrase: p.apiPassphrase,

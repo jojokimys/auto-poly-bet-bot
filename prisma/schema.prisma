@@ -110,6 +110,7 @@ model BotProfile {
   name          String
   privateKey    String
   funderAddress String   @default("")
+  signatureType Int      @default(2) // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
   apiKey        String
   apiSecret     String
   apiPassphrase String

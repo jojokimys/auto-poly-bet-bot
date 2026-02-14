@@ -8,6 +8,7 @@ const updateProfileSchema = z.object({
   name: z.string().min(1).optional(),
   privateKey: z.string().min(1).optional(),
   funderAddress: z.string().optional(),
+  signatureType: z.number().int().min(0).max(2).optional(),
   apiKey: z.string().min(1).optional(),
   apiSecret: z.string().min(1).optional(),
   apiPassphrase: z.string().min(1).optional(),
@@ -105,6 +106,7 @@ export async function PUT(
     if (data.name !== undefined) updateData.name = data.name;
     if (data.privateKey !== undefined) updateData.privateKey = data.privateKey;
     if (data.funderAddress !== undefined) updateData.funderAddress = data.funderAddress;
+    if (data.signatureType !== undefined) updateData.signatureType = data.signatureType;
     if (data.apiKey !== undefined) updateData.apiKey = data.apiKey;
     if (data.apiSecret !== undefined) updateData.apiSecret = data.apiSecret;
     if (data.apiPassphrase !== undefined) updateData.apiPassphrase = data.apiPassphrase;
@@ -117,7 +119,7 @@ export async function PUT(
     });
 
     // If credentials changed, clear the cached client so it gets recreated
-    if (data.privateKey || data.apiKey || data.apiSecret || data.apiPassphrase || data.funderAddress !== undefined) {
+    if (data.privateKey || data.apiKey || data.apiSecret || data.apiPassphrase || data.funderAddress !== undefined || data.signatureType !== undefined) {
       clearProfileClient(id);
     }
 

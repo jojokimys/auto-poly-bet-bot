@@ -126,6 +126,7 @@ async function loadProfileCredentials(profileId: string): Promise<ProfileCredent
     name: profile.name,
     privateKey: profile.privateKey,
     funderAddress: profile.funderAddress,
+    signatureType: profile.signatureType,
     apiKey: profile.apiKey,
     apiSecret: profile.apiSecret,
     apiPassphrase: profile.apiPassphrase,

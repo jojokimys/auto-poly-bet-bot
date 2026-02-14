@@ -13,6 +13,7 @@ export interface ProfileCredentials {
   name: string;
   privateKey: string;
   funderAddress: string;
+  signatureType?: number; // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
   apiKey: string;
   apiSecret: string;
   apiPassphrase: string;
@@ -34,7 +35,7 @@ export function getClientForProfile(profile: ProfileCredentials): ClobClient {
   };
 
   const funder = profile.funderAddress || undefined;
-  const sigType = funder ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+  const sigType = profile.signatureType ?? (funder ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA);
 
   const client = new ClobClient(
     env.CLOB_API_URL,

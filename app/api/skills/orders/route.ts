@@ -52,8 +52,8 @@ export async function DELETE(req: NextRequest) {
 
     const profile: ProfileCredentials = {
       id: p.id, name: p.name, privateKey: p.privateKey,
-      funderAddress: p.funderAddress, apiKey: p.apiKey,
-      apiSecret: p.apiSecret, apiPassphrase: p.apiPassphrase,
+      funderAddress: p.funderAddress, signatureType: p.signatureType,
+      apiKey: p.apiKey, apiSecret: p.apiSecret, apiPassphrase: p.apiPassphrase,
     };
 
     const result = await cancelAllProfileOrders(profile);
