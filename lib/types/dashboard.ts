@@ -12,6 +12,8 @@ export interface DashboardTrade {
   cost: number;
   matchTime: string;
   realizedPnl: number | null;
+  profileId?: string;
+  profileName?: string;
 }
 
 export interface DashboardStats {

@@ -25,7 +25,9 @@ export async function fetchEvents(params?: {
   const qs = searchParams.toString();
   const url = gammaUrl(`/events${qs ? `?${qs}` : ''}`);
 
-  const res = await fetch(url, { next: { revalidate: 60 } });
+  // Events include nested markets arrays — responses can exceed 6MB,
+  // which is above Next.js data cache 2MB limit. Skip cache entirely.
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`Gamma events fetch failed: ${res.status}`);
   return res.json();
 }

@@ -3,6 +3,7 @@ import './globals.css';
 import { ThemeProvider } from '@/components/ThemeProvider';
 import { Header } from '@/components/Header';
 import { Sidebar } from '@/components/Sidebar';
+import { ToastProvider } from '@/components/ToastProvider';
 import { HeroUIProvider } from '@heroui/react';
 
 export const metadata: Metadata = {
@@ -29,6 +30,7 @@ export default function RootLayout({
                 </main>
               </div>
             </div>
+            <ToastProvider />
           </ThemeProvider>
         </HeroUIProvider>
       </body>

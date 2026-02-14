@@ -14,7 +14,7 @@ const updateSettingsSchema = z.object({
   minVolume: z.number().min(0).optional(),
   maxSpread: z.number().min(0).max(1).optional(),
   autoBettingEnabled: z.boolean().optional(),
-  scanIntervalMinutes: z.number().int().min(1).max(1440).optional(),
+  scanIntervalSeconds: z.number().int().min(5).max(3600).optional(),
 });
 
 function toPublic(settings: any): BotSettingsPublic {
@@ -27,7 +27,7 @@ function toPublic(settings: any): BotSettingsPublic {
     minVolume: settings.minVolume,
     maxSpread: settings.maxSpread,
     autoBettingEnabled: settings.autoBettingEnabled,
-    scanIntervalMinutes: settings.scanIntervalMinutes,
+    scanIntervalSeconds: settings.scanIntervalSeconds,
     updatedAt: settings.updatedAt.toISOString(),
     hasPrivateKey: !!settings.privateKey,
     hasApiCredentials: !!(settings.apiKey && settings.apiSecret && settings.apiPassphrase),

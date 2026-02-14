@@ -8,10 +8,19 @@ import type {
   PnlDataPoint,
   DashboardData,
 } from '@/lib/types/dashboard';
-import { getTrades, getBalanceAllowance } from './trading';
+import { prisma } from '@/lib/db/prisma';
+import {
+  getClientForProfile,
+  getProfileBalance,
+  type ProfileCredentials,
+} from '@/lib/bot/profile-client';
 
 /** Convert raw TradeRecord → DashboardTrade with numeric fields */
-export function parseTrade(t: TradeRecord): DashboardTrade {
+export function parseTrade(
+  t: TradeRecord,
+  profileId?: string,
+  profileName?: string,
+): DashboardTrade {
   const price = parseFloat(t.price);
   const size = parseFloat(t.size);
   const feeRateBps = parseFloat(t.fee_rate_bps || '0');
@@ -30,25 +39,29 @@ export function parseTrade(t: TradeRecord): DashboardTrade {
     cost,
     matchTime: t.match_time,
     realizedPnl: null,
+    profileId,
+    profileName,
   };
 }
 
 /**
- * FIFO BUY/SELL matching per asset_id.
+ * FIFO BUY/SELL matching per asset_id (and per profile when mixing profiles).
  * Sets `realizedPnl` on sell trades.
  */
 export function matchTrades(trades: DashboardTrade[]): DashboardTrade[] {
-  // Group by asset_id
-  const byAsset = new Map<string, DashboardTrade[]>();
+  // Group by composite key: profileId + asset_id
+  // This ensures FIFO matching is scoped per-profile per-asset
+  const byKey = new Map<string, DashboardTrade[]>();
   for (const t of trades) {
-    const list = byAsset.get(t.asset_id) ?? [];
+    const key = `${t.profileId ?? '_'}::${t.asset_id}`;
+    const list = byKey.get(key) ?? [];
     list.push(t);
-    byAsset.set(t.asset_id, list);
+    byKey.set(key, list);
   }
 
   const result: DashboardTrade[] = [];
 
-  for (const [, assetTrades] of byAsset) {
+  for (const [, assetTrades] of byKey) {
     // Sort chronologically
     assetTrades.sort(
       (a, b) => new Date(a.matchTime).getTime() - new Date(b.matchTime).getTime()
@@ -108,9 +121,10 @@ export function computeStats(
   // Count open positions: assets with unmatched buys
   const netByAsset = new Map<string, number>();
   for (const t of trades) {
-    const current = netByAsset.get(t.asset_id) ?? 0;
+    const key = `${t.profileId ?? '_'}::${t.asset_id}`;
+    const current = netByAsset.get(key) ?? 0;
     netByAsset.set(
-      t.asset_id,
+      key,
       t.side === 'BUY' ? current + t.size : current - t.size
     );
   }
@@ -189,24 +203,178 @@ export function buildPnlHistory(trades: DashboardTrade[]): PnlDataPoint[] {
   });
 }
 
-/** Main entry: fetch data from Polymarket and compute all analytics */
-export async function getDashboardData(): Promise<DashboardData> {
-  const [rawTrades, balanceResult] = await Promise.all([
-    getTrades(),
-    getBalanceAllowance(),
+/** Fetch trades for a single profile from Polymarket API */
+async function fetchProfileTrades(
+  profile: ProfileCredentials,
+): Promise<TradeRecord[]> {
+  const client = getClientForProfile(profile);
+  const trades = await client.getTrades();
+
+  return (trades as any[]).map((t) => ({
+    id: t.id,
+    market: t.market,
+    asset_id: t.asset_id,
+    side: t.side as 'BUY' | 'SELL',
+    price: t.price,
+    size: t.size,
+    fee_rate_bps: t.fee_rate_bps,
+    status: t.status,
+    match_time: t.match_time,
+    type: t.type || 'LIMIT',
+    outcome: t.outcome,
+  }));
+}
+
+/** Load a single profile's credentials from DB */
+async function loadProfileCredentials(
+  profileId: string,
+): Promise<ProfileCredentials | null> {
+  const profile = await prisma.botProfile.findUnique({
+    where: { id: profileId },
+  });
+  if (!profile) return null;
+  return {
+    id: profile.id,
+    name: profile.name,
+    privateKey: profile.privateKey,
+    funderAddress: profile.funderAddress,
+    apiKey: profile.apiKey,
+    apiSecret: profile.apiSecret,
+    apiPassphrase: profile.apiPassphrase,
+  };
+}
+
+/** Load all active profiles' credentials from DB */
+async function loadAllProfileCredentials(): Promise<ProfileCredentials[]> {
+  const profiles = await prisma.botProfile.findMany({
+    where: { isActive: true },
+  });
+  return profiles.map((p) => ({
+    id: p.id,
+    name: p.name,
+    privateKey: p.privateKey,
+    funderAddress: p.funderAddress,
+    apiKey: p.apiKey,
+    apiSecret: p.apiSecret,
+    apiPassphrase: p.apiPassphrase,
+  }));
+}
+
+/**
+ * Main entry: fetch data from Polymarket and compute all analytics.
+ * @param profileId - specific profile ID, or undefined/null for all profiles
+ */
+export async function getDashboardData(
+  profileId?: string | null,
+): Promise<DashboardData> {
+  if (profileId) {
+    // Single profile mode
+    return getDashboardDataForProfile(profileId);
+  }
+  // All profiles mode
+  return getDashboardDataForAllProfiles();
+}
+
+/** Dashboard data for a single profile */
+async function getDashboardDataForProfile(
+  profileId: string,
+): Promise<DashboardData> {
+  const creds = await loadProfileCredentials(profileId);
+  if (!creds) {
+    return {
+      trades: [],
+      stats: {
+        totalTrades: 0,
+        totalBuys: 0,
+        totalSells: 0,
+        winRate: 0,
+        totalPnl: 0,
+        avgTradeSize: 0,
+        bestTrade: 0,
+        worstTrade: 0,
+        profitFactor: 0,
+        totalFees: 0,
+        openPositions: 0,
+        currentBalance: 0,
+      },
+      balanceHistory: [],
+      pnlHistory: [],
+    };
+  }
+
+  const [rawTrades, balance] = await Promise.all([
+    fetchProfileTrades(creds),
+    getProfileBalance(creds),
   ]);
 
-  const currentBalance = parseFloat(balanceResult.balance);
-  const parsed = rawTrades.map(parseTrade);
+  const parsed = rawTrades.map((t) => parseTrade(t, creds.id, creds.name));
   const matched = matchTrades(parsed);
-  const stats = computeStats(matched, currentBalance);
-  const balanceHistory = buildBalanceHistory(matched, currentBalance);
+  const stats = computeStats(matched, balance);
+  const balanceHistory = buildBalanceHistory(matched, balance);
   const pnlHistory = buildPnlHistory(matched);
 
-  return {
-    trades: matched,
-    stats,
-    balanceHistory,
-    pnlHistory,
-  };
+  return { trades: matched, stats, balanceHistory, pnlHistory };
+}
+
+/** Dashboard data aggregated across all active profiles */
+async function getDashboardDataForAllProfiles(): Promise<DashboardData> {
+  const allCreds = await loadAllProfileCredentials();
+
+  if (allCreds.length === 0) {
+    return {
+      trades: [],
+      stats: {
+        totalTrades: 0,
+        totalBuys: 0,
+        totalSells: 0,
+        winRate: 0,
+        totalPnl: 0,
+        avgTradeSize: 0,
+        bestTrade: 0,
+        worstTrade: 0,
+        profitFactor: 0,
+        totalFees: 0,
+        openPositions: 0,
+        currentBalance: 0,
+      },
+      balanceHistory: [],
+      pnlHistory: [],
+    };
+  }
+
+  // Fetch trades and balances for all profiles in parallel
+  const results = await Promise.all(
+    allCreds.map(async (creds) => {
+      try {
+        const [rawTrades, balance] = await Promise.all([
+          fetchProfileTrades(creds),
+          getProfileBalance(creds),
+        ]);
+        return {
+          creds,
+          trades: rawTrades.map((t) => parseTrade(t, creds.id, creds.name)),
+          balance,
+        };
+      } catch (error) {
+        console.error(`Failed to fetch data for profile ${creds.name}:`, error);
+        return { creds, trades: [] as DashboardTrade[], balance: 0 };
+      }
+    }),
+  );
+
+  // Merge all trades and sum balances
+  const allTrades: DashboardTrade[] = [];
+  let totalBalance = 0;
+
+  for (const r of results) {
+    allTrades.push(...r.trades);
+    totalBalance += r.balance;
+  }
+
+  const matched = matchTrades(allTrades);
+  const stats = computeStats(matched, totalBalance);
+  const balanceHistory = buildBalanceHistory(matched, totalBalance);
+  const pnlHistory = buildPnlHistory(matched);
+
+  return { trades: matched, stats, balanceHistory, pnlHistory };
 }

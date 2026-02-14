@@ -19,6 +19,7 @@ import type { DashboardTrade } from '@/lib/types/dashboard';
 interface TradeHistoryTableProps {
   trades: DashboardTrade[];
   loading: boolean;
+  showProfile?: boolean;
 }
 
 const ROWS_PER_PAGE = 10;
@@ -32,7 +33,58 @@ function formatDate(dateStr: string): string {
   });
 }
 
-export function TradeHistoryTable({ trades, loading }: TradeHistoryTableProps) {
+function renderCells(trade: DashboardTrade, showProfile?: boolean) {
+  const cells = [
+    <TableCell key="date">{formatDate(trade.matchTime)}</TableCell>,
+  ];
+
+  if (showProfile) {
+    cells.push(
+      <TableCell key="profile">
+        <Chip size="sm" variant="flat" color="default">
+          {trade.profileName || 'Unknown'}
+        </Chip>
+      </TableCell>
+    );
+  }
+
+  cells.push(
+    <TableCell key="side">
+      <Chip
+        size="sm"
+        variant="flat"
+        color={trade.side === 'BUY' ? 'primary' : 'warning'}
+      >
+        {trade.side}
+      </Chip>
+    </TableCell>,
+    <TableCell key="outcome" className="max-w-[120px] truncate">
+      {trade.outcome}
+    </TableCell>,
+    <TableCell key="price">${trade.price.toFixed(2)}</TableCell>,
+    <TableCell key="size">{trade.size.toFixed(2)}</TableCell>,
+    <TableCell key="fee" className="text-gray-500">
+      ${trade.fee.toFixed(4)}
+    </TableCell>,
+    <TableCell key="pnl">
+      {trade.realizedPnl !== null ? (
+        <Chip
+          size="sm"
+          variant="flat"
+          color={trade.realizedPnl >= 0 ? 'success' : 'danger'}
+        >
+          ${trade.realizedPnl.toFixed(2)}
+        </Chip>
+      ) : (
+        <span className="text-gray-400">--</span>
+      )}
+    </TableCell>,
+  );
+
+  return cells;
+}
+
+export function TradeHistoryTable({ trades, loading, showProfile }: TradeHistoryTableProps) {
   const [page, setPage] = useState(1);
 
   const sortedTrades = useMemo(
@@ -47,6 +99,20 @@ export function TradeHistoryTable({ trades, loading }: TradeHistoryTableProps) {
     (page - 1) * ROWS_PER_PAGE,
     page * ROWS_PER_PAGE
   );
+
+  const columns = useMemo(() => {
+    const cols = [
+      { key: 'date', label: 'Date' },
+      ...(showProfile ? [{ key: 'profile', label: 'Profile' }] : []),
+      { key: 'side', label: 'Side' },
+      { key: 'outcome', label: 'Outcome' },
+      { key: 'price', label: 'Price' },
+      { key: 'size', label: 'Size' },
+      { key: 'fee', label: 'Fee' },
+      { key: 'pnl', label: 'P&L' },
+    ];
+    return cols;
+  }, [showProfile]);
 
   return (
     <Card>
@@ -79,48 +145,14 @@ export function TradeHistoryTable({ trades, loading }: TradeHistoryTableProps) {
               }}
             >
               <TableHeader>
-                <TableColumn>Date</TableColumn>
-                <TableColumn>Side</TableColumn>
-                <TableColumn>Outcome</TableColumn>
-                <TableColumn>Price</TableColumn>
-                <TableColumn>Size</TableColumn>
-                <TableColumn>Fee</TableColumn>
-                <TableColumn>P&L</TableColumn>
+                {columns.map((col) => (
+                  <TableColumn key={col.key}>{col.label}</TableColumn>
+                ))}
               </TableHeader>
               <TableBody>
                 {paginated.map((trade) => (
                   <TableRow key={trade.id}>
-                    <TableCell>{formatDate(trade.matchTime)}</TableCell>
-                    <TableCell>
-                      <Chip
-                        size="sm"
-                        variant="flat"
-                        color={trade.side === 'BUY' ? 'primary' : 'warning'}
-                      >
-                        {trade.side}
-                      </Chip>
-                    </TableCell>
-                    <TableCell className="max-w-[120px] truncate">
-                      {trade.outcome}
-                    </TableCell>
-                    <TableCell>${trade.price.toFixed(2)}</TableCell>
-                    <TableCell>{trade.size.toFixed(2)}</TableCell>
-                    <TableCell className="text-gray-500">
-                      ${trade.fee.toFixed(4)}
-                    </TableCell>
-                    <TableCell>
-                      {trade.realizedPnl !== null ? (
-                        <Chip
-                          size="sm"
-                          variant="flat"
-                          color={trade.realizedPnl >= 0 ? 'success' : 'danger'}
-                        >
-                          ${trade.realizedPnl.toFixed(2)}
-                        </Chip>
-                      ) : (
-                        <span className="text-gray-400">--</span>
-                      )}
-                    </TableCell>
+                    {renderCells(trade, showProfile)}
                   </TableRow>
                 ))}
               </TableBody>

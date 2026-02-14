@@ -21,7 +21,7 @@ export async function GET(
       }),
     );
 
-    return NextResponse.json({ market, orderBooks: orderBooks.filter(Boolean) });
+    return NextResponse.json({ market, orderBooks });
   } catch (error) {
     console.error('Failed to fetch market:', error);
     return NextResponse.json(

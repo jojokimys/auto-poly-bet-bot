@@ -72,7 +72,7 @@ export interface BotSettings {
   minVolume: number;
   maxSpread: number;
   autoBettingEnabled: boolean;
-  scanIntervalMinutes: number;
+  scanIntervalSeconds: number;
   // Timestamps
   updatedAt: string;
 }

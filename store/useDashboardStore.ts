@@ -9,7 +9,9 @@ interface DashboardState {
   loading: boolean;
   error: string | null;
   lastFetchedAt: number | null;
-  fetchDashboard: () => Promise<void>;
+  selectedProfileId: string | null; // null = all profiles
+  fetchDashboard: (profileId?: string | null) => Promise<void>;
+  setSelectedProfileId: (profileId: string | null) => void;
 }
 
 const DEBOUNCE_MS = 30_000;
@@ -22,15 +24,30 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   loading: false,
   error: null,
   lastFetchedAt: null,
+  selectedProfileId: null,
 
-  fetchDashboard: async () => {
-    const { lastFetchedAt, loading } = get();
-    if (loading) return;
-    if (lastFetchedAt && Date.now() - lastFetchedAt < DEBOUNCE_MS) return;
+  setSelectedProfileId: (profileId: string | null) => {
+    const { selectedProfileId } = get();
+    if (profileId === selectedProfileId) return;
+    // Reset debounce so fetch happens immediately on profile change
+    set({ selectedProfileId: profileId, lastFetchedAt: null });
+  },
+
+  fetchDashboard: async (profileId?: string | null) => {
+    const state = get();
+    if (state.loading) return;
+
+    // Use provided profileId or the stored one
+    const targetProfileId = profileId !== undefined ? profileId : state.selectedProfileId;
+
+    if (state.lastFetchedAt && Date.now() - state.lastFetchedAt < DEBOUNCE_MS) return;
 
     set({ loading: true, error: null });
     try {
-      const res = await fetch('/api/dashboard');
+      const url = targetProfileId
+        ? `/api/dashboard?profileId=${encodeURIComponent(targetProfileId)}`
+        : '/api/dashboard';
+      const res = await fetch(url);
       if (!res.ok) throw new Error('Failed to fetch dashboard data');
       const data: DashboardData = await res.json();
       set({

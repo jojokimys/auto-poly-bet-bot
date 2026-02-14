@@ -85,7 +85,7 @@ model BotSettings {
   minVolume           Float   @default(5000)
   maxSpread           Float   @default(0.05)
   autoBettingEnabled  Boolean @default(false)
-  scanIntervalMinutes Int     @default(5)
+  scanIntervalSeconds Int     @default(30)
 
   updatedAt DateTime @updatedAt
 }
@@ -105,8 +105,23 @@ model MarketSnapshot {
   @@index([marketId, snapshotAt])
 }
 
+model BotProfile {
+  id            String   @id @default(cuid())
+  name          String
+  privateKey    String
+  funderAddress String   @default("")
+  apiKey        String
+  apiSecret     String
+  apiPassphrase String
+  isActive      Boolean  @default(true)
+  strategy      String   @default("value-betting")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
 model BotLog {
   id        String   @id @default(cuid())
+  profileId String?  // null for legacy / non-profile logs
   level     String   // info, warn, error, trade
   event     String   // scan, signal, order, risk, start, stop, error
   message   String
@@ -115,4 +130,75 @@ model BotLog {
 
   @@index([createdAt])
   @@index([event])
+  @@index([profileId])
+}
+
+model ScalperPosition {
+  id          String   @id @default(cuid())
+  profileId   String
+  conditionId String
+  tokenId     String
+  outcome     String
+  entryPrice  Float
+  entryTime   DateTime
+  size        Float
+  targetPrice Float
+  stopPrice   Float
+  status      String   @default("OPEN") // OPEN | CLOSED
+  closedAt    DateTime?
+  closeReason String?
+
+  @@unique([profileId, conditionId])
+  @@index([profileId, status])
+}
+
+// ─── AI Trading Team Models ─────────────────────────────
+
+model AiSession {
+  id         String       @id @default(cuid())
+  profileId  String
+  startedAt  DateTime     @default(now())
+  endedAt    DateTime?
+  cycleCount Int          @default(0)
+  totalPnl   Float        @default(0)
+  summary    String?
+  decisions  AiDecision[]
+
+  @@index([profileId])
+}
+
+model AiDecision {
+  id          String   @id @default(cuid())
+  sessionId   String
+  profileId   String
+  type        String   // "trade" | "hold" | "exit" | "skip"
+  conditionId String?
+  action      String?  // "BUY" | "SELL"
+  tokenId     String?
+  outcome     String?
+  price       Float?
+  size        Float?
+  reason      String
+  confidence  Int      // 0-100
+  result      String?  // "success" | "failed" | "pending"
+  pnl         Float?
+  createdAt   DateTime @default(now())
+
+  session AiSession @relation(fields: [sessionId], references: [id])
+
+  @@index([profileId, createdAt])
+  @@index([sessionId])
+}
+
+model AiLearning {
+  id         String   @id @default(cuid())
+  profileId  String
+  category   String   // "strategy" | "risk" | "market" | "execution"
+  insight    String
+  confidence Int
+  source     String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@index([profileId, category])
 }

@@ -12,8 +12,8 @@ interface MarketDetailProps {
 
 function OrderBookTable({ book, label }: { book: OrderBookSummary | null; label: string }) {
   if (!book) return null;
-  const topBids = book.bids.slice(0, 5);
-  const topAsks = book.asks.slice(0, 5);
+  const topBids = (book.bids ?? []).slice(0, 5);
+  const topAsks = (book.asks ?? []).slice(0, 5);
 
   return (
     <div className="space-y-2">
