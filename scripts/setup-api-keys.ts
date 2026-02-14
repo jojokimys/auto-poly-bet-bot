@@ -68,9 +68,9 @@ async function main() {
   const wallet = new Wallet(privateKey);
 
   const sigType = funderAddress
-    ? SignatureType.POLY_GNOSIS_SAFE
+    ? SignatureType.POLY_PROXY
     : SignatureType.EOA;
-  const sigLabel = funderAddress ? 'POLY_GNOSIS_SAFE (proxy)' : 'EOA (direct)';
+  const sigLabel = funderAddress ? 'POLY_PROXY' : 'EOA (direct)';
 
   console.log('='.repeat(60));
   console.log('  Polymarket API Key Setup');

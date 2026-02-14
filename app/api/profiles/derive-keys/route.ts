@@ -92,7 +92,7 @@ export async function POST(req: NextRequest) {
     }
 
     const sigType = funderAddress
-      ? SignatureType.POLY_GNOSIS_SAFE
+      ? SignatureType.POLY_PROXY
       : SignatureType.EOA;
 
     const client = new ClobClient(

@@ -39,7 +39,7 @@ export function getAuthClient(): ClobClient {
   // Use POLY_GNOSIS_SAFE when a funder address (proxy wallet) is configured,
   // otherwise default to EOA signing.
   const funder = env.FUNDER_ADDRESS || undefined;
-  const sigType = funder ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+  const sigType = funder ? SignatureType.POLY_PROXY : SignatureType.EOA;
 
   authClient = new ClobClient(
     env.CLOB_API_URL,

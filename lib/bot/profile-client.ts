@@ -35,7 +35,7 @@ export function getClientForProfile(profile: ProfileCredentials): ClobClient {
   };
 
   const funder = profile.funderAddress || undefined;
-  const sigType = profile.signatureType ?? (funder ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA);
+  const sigType = profile.signatureType ?? (funder ? SignatureType.POLY_PROXY : SignatureType.EOA);
 
   const client = new ClobClient(
     env.CLOB_API_URL,
