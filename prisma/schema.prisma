@@ -70,26 +70,6 @@ model Trade {
   order Order @relation(fields: [orderId], references: [id])
 }
 
-model BotSettings {
-  id                  String  @id @default("default")
-  // Wallet (encrypted at rest in production)
-  privateKey          String  @default("")
-  funderAddress       String  @default("")
-  // API credentials
-  apiKey              String  @default("")
-  apiSecret           String  @default("")
-  apiPassphrase       String  @default("")
-  // Bot config
-  maxBetAmount        Float   @default(10)
-  minLiquidity        Float   @default(1000)
-  minVolume           Float   @default(5000)
-  maxSpread           Float   @default(0.05)
-  autoBettingEnabled  Boolean @default(false)
-  scanIntervalSeconds Int     @default(30)
-
-  updatedAt DateTime @updatedAt
-}
-
 model MarketSnapshot {
   id          String   @id @default(cuid())
   marketId    String
@@ -106,18 +86,22 @@ model MarketSnapshot {
 }
 
 model BotProfile {
-  id            String   @id @default(cuid())
-  name          String
-  privateKey    String
-  funderAddress String   @default("")
-  signatureType Int      @default(2) // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
-  apiKey        String
-  apiSecret     String
-  apiPassphrase String
-  isActive      Boolean  @default(true)
-  strategy      String   @default("value-betting")
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id                    String   @id @default(cuid())
+  name                  String
+  privateKey            String
+  funderAddress         String   @default("")
+  signatureType         Int      @default(2) // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
+  apiKey                String
+  apiSecret             String
+  apiPassphrase         String
+  builderApiKey         String   @default("")
+  builderApiSecret      String   @default("")
+  builderApiPassphrase  String   @default("")
+  isActive              Boolean  @default(true)
+  enabledStrategies     String   @default("[\"value-betting\"]")
+  maxPortfolioExposure  Float    @default(0.4)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 }
 
 model BotLog {
@@ -132,25 +116,6 @@ model BotLog {
   @@index([createdAt])
   @@index([event])
   @@index([profileId])
-}
-
-model ScalperPosition {
-  id          String   @id @default(cuid())
-  profileId   String
-  conditionId String
-  tokenId     String
-  outcome     String
-  entryPrice  Float
-  entryTime   DateTime
-  size        Float
-  targetPrice Float
-  stopPrice   Float
-  status      String   @default("OPEN") // OPEN | CLOSED
-  closedAt    DateTime?
-  closeReason String?
-
-  @@unique([profileId, conditionId])
-  @@index([profileId, status])
 }
 
 // ─── AI Trading Team Models ─────────────────────────────
@@ -181,6 +146,7 @@ model AiDecision {
   size        Float?
   reason      String
   confidence  Int      // 0-100
+  strategy    String?  // strategy name (e.g. "value-betting")
   result      String?  // "success" | "failed" | "pending"
   pnl         Float?
   createdAt   DateTime @default(now())
