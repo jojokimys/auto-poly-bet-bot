@@ -39,6 +39,8 @@ export async function fetchMarkets(params?: {
   closed?: boolean;
   order?: string;
   ascending?: boolean;
+  endDateMin?: string;
+  noCache?: boolean;
 }): Promise<GammaMarket[]> {
   const searchParams = new URLSearchParams();
   if (params?.limit) searchParams.set('limit', String(params.limit));
@@ -47,11 +49,15 @@ export async function fetchMarkets(params?: {
   if (params?.closed !== undefined) searchParams.set('closed', String(params.closed));
   if (params?.order) searchParams.set('order', params.order);
   if (params?.ascending !== undefined) searchParams.set('ascending', String(params.ascending));
+  if (params?.endDateMin) searchParams.set('end_date_min', params.endDateMin);
 
   const qs = searchParams.toString();
   const url = gammaUrl(`/markets${qs ? `?${qs}` : ''}`);
 
-  const res = await fetch(url, { next: { revalidate: 60 } });
+  const cacheOpt = params?.noCache
+    ? { cache: 'no-store' as const }
+    : { next: { revalidate: 60 } };
+  const res = await fetch(url, cacheOpt);
   if (!res.ok) throw new Error(`Gamma markets fetch failed: ${res.status}`);
   return res.json();
 }

@@ -241,6 +241,9 @@ async function loadProfileCredentials(
     apiKey: profile.apiKey,
     apiSecret: profile.apiSecret,
     apiPassphrase: profile.apiPassphrase,
+    builderApiKey: profile.builderApiKey,
+    builderApiSecret: profile.builderApiSecret,
+    builderApiPassphrase: profile.builderApiPassphrase,
   };
 }
 
@@ -258,6 +261,9 @@ async function loadAllProfileCredentials(): Promise<ProfileCredentials[]> {
     apiKey: p.apiKey,
     apiSecret: p.apiSecret,
     apiPassphrase: p.apiPassphrase,
+    builderApiKey: p.builderApiKey,
+    builderApiSecret: p.builderApiSecret,
+    builderApiPassphrase: p.builderApiPassphrase,
   }));
 }
 
