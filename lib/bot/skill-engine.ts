@@ -2,10 +2,16 @@ import 'server-only';
 
 import { prisma } from '@/lib/db/prisma';
 import { clearProfileClient } from './profile-client';
+import {
+  addOpportunity,
+  getAutoExecutableOpportunities,
+  markAutoExecuted,
+  expireStale,
+} from './opportunity-queue';
 import { getPositions } from '@/lib/skills/position-monitor';
 import { getRiskAssessment } from '@/lib/skills/risk-manager';
 import { explore } from '@/lib/skills/explorer';
-import { executeOrder } from '@/lib/skills/order-manager';
+import { executeOrder, executeArbOrder } from '@/lib/skills/order-manager';
 import { executeEarlyExits } from '@/lib/skills/early-exit';
 import {
   createSession,
@@ -14,7 +20,6 @@ import {
   logDecision,
 } from '@/lib/skills/reporter';
 import type { BotState, BotLogEntry } from './types';
-import type { Opportunity } from '@/lib/skills/types';
 
 const MAX_LOG_BUFFER = 200;
 const MAX_ORDERS_PER_CYCLE = 3;
@@ -31,7 +36,10 @@ interface BotInstance {
   logBuffer: BotLogEntry[];
 }
 
-const instances = new Map<string, BotInstance>();
+// Use globalThis to survive Next.js HMR — prevents zombie engine loops
+const globalForEngine = globalThis as unknown as { __engineInstances: Map<string, BotInstance> };
+globalForEngine.__engineInstances ??= new Map<string, BotInstance>();
+const instances = globalForEngine.__engineInstances;
 
 // ─── Logging ─────────────────────────────────────────────
 
@@ -82,11 +90,10 @@ async function log(
 
 // ─── Config ──────────────────────────────────────────────
 
-async function loadScanInterval(): Promise<number> {
-  const settings = await prisma.botSettings.findUnique({
-    where: { id: 'default' },
-  });
-  return (settings?.scanIntervalSeconds ?? 30) * 1000;
+const DEFAULT_SCAN_INTERVAL_MS = 30 * 1000;
+
+function loadScanInterval(): number {
+  return DEFAULT_SCAN_INTERVAL_MS;
 }
 
 // ─── Cycle Loop ──────────────────────────────────────────
@@ -251,69 +258,112 @@ async function runCycle(instance: BotInstance) {
       return;
     }
 
-    // ── Phase 3: Decision ──
-    const viable = opportunities.filter((opp) => {
-      if (opp.confidence < MIN_CONFIDENCE) return false;
-      if (opp.suggestedPrice * opp.suggestedSize > risk.limits.maxPositionSize) return false;
-      if (risk.limits.remainingCapacity <= 0) return false;
-      return true;
-    });
-
-    if (viable.length === 0) {
-      await log(instance, 'info', 'scan', `No viable opportunities (${opportunities.length} below thresholds)`);
-      if (instance.sessionId) {
-        await logDecision({
-          sessionId: instance.sessionId,
-          profileId: instance.profileId,
-          type: 'skip',
-          reason: `${opportunities.length} opportunities found but none met confidence/risk thresholds`,
-          confidence: 70,
-        });
-        await incrementCycle(instance.sessionId);
-      }
-      return;
+    // ── Phase 3: Queue all opportunities ──
+    expireStale();
+    let queued = 0;
+    for (const opp of opportunities) {
+      if (opp.confidence < MIN_CONFIDENCE) continue;
+      if (addOpportunity(opp)) queued++;
     }
 
-    // ── Phase 4: Execution ──
+    await log(instance, 'info', 'scan', `Queued ${queued} new opportunities (${opportunities.length} total found)`);
+
+    // ── Phase 4: Auto-execute arb opportunities only ──
+    const autoOpps = getAutoExecutableOpportunities();
     let ordersThisCycle = 0;
 
-    for (const opp of viable) {
+    if (autoOpps.length > 0) {
+      await log(instance, 'info', 'scan', `${autoOpps.length} auto-executable arb opportunities in queue`);
+    }
+
+    for (const queuedOpp of autoOpps) {
       if (ordersThisCycle >= MAX_ORDERS_PER_CYCLE) break;
       if (ordersThisCycle >= risk.limits.remainingCapacity) break;
 
-      // Cap size to maxPositionSize
+      const opp = queuedOpp.opportunity;
+
+      // Safety: skip arbs with too many legs (partial fill risk)
+      const legCount = 1 + (opp.arbLegs?.length ?? 0);
+      if (legCount > 3) {
+        await log(instance, 'warn', 'order', `Skipping ${legCount}-leg arb (too many legs, partial fill risk): ${opp.question.slice(0, 60)}`);
+        markAutoExecuted(queuedOpp.id);
+        continue;
+      }
+
+      // Cap size to maxPositionSize (use combined cost for arb)
       let size = opp.suggestedSize;
-      if (opp.suggestedPrice * size > risk.limits.maxPositionSize) {
-        size = Math.floor((risk.limits.maxPositionSize / opp.suggestedPrice) * 100) / 100;
+      const combinedCost = opp.arbLegs
+        ? opp.suggestedPrice + opp.arbLegs.reduce((s, l) => s + l.price, 0)
+        : opp.suggestedPrice;
+      if (combinedCost * size > risk.limits.maxPositionSize) {
+        size = Math.floor((risk.limits.maxPositionSize / combinedCost) * 100) / 100;
       }
       if (size < 1) continue;
 
-      await log(instance, 'trade', 'order', `Executing: ${opp.signal} ${size}x ${opp.outcome} @ $${opp.suggestedPrice}`, {
+      await log(instance, 'trade', 'order', `Auto-executing arb (${legCount} legs): ${opp.signal} ${size}x ${opp.outcome} @ $${opp.suggestedPrice}`, {
         type: opp.type,
         question: opp.question.slice(0, 80),
         confidence: opp.confidence,
         reasoning: opp.reasoning,
+        arbLegs: opp.arbLegs?.length ?? 0,
       });
 
-      const result = await executeOrder({
+      // Build all legs: primary + arbLegs
+      const primaryLeg = {
         profileId: instance.profileId,
-        action: opp.signal,
+        action: opp.signal as 'BUY' | 'SELL',
         conditionId: opp.conditionId,
         tokenId: opp.tokenId,
         outcome: opp.outcome,
         price: opp.suggestedPrice,
         size,
-        reason: `[${opp.type}] ${opp.reasoning}`,
-      });
+        reason: `[auto:${opp.type}] ${opp.reasoning}`,
+      };
 
-      if (result.success) {
-        ordersThisCycle++;
-        instance.state.ordersPlaced++;
-        await log(instance, 'trade', 'order', `Order placed: ${result.message}`, {
-          orderId: result.orderId,
-        });
+      if (opp.arbLegs && opp.arbLegs.length > 0) {
+        // Multi-leg arb: execute all legs in parallel
+        const allLegs = [
+          primaryLeg,
+          ...opp.arbLegs.map(leg => ({
+            profileId: instance.profileId,
+            action: 'BUY' as const,
+            conditionId: leg.conditionId,
+            tokenId: leg.tokenId,
+            outcome: leg.outcome,
+            price: leg.price,
+            size,
+            reason: `[auto:${opp.type}:leg] ${opp.reasoning}`,
+          })),
+        ];
+
+        const arbResult = await executeArbOrder(allLegs);
+
+        if (arbResult.success) {
+          ordersThisCycle++;
+          instance.state.ordersPlaced += allLegs.length;
+          markAutoExecuted(queuedOpp.id);
+          await log(instance, 'trade', 'order', `Arb complete: ${arbResult.message}`, {
+            orderIds: arbResult.results.map(r => r.orderId),
+          });
+        } else {
+          await log(instance, 'error', 'order', `Arb failed: ${arbResult.message}`, {
+            results: arbResult.results.map(r => ({ success: r.success, msg: r.message })),
+          });
+        }
       } else {
-        await log(instance, 'error', 'order', `Order failed: ${result.message}`);
+        // Single-leg (fallback)
+        const result = await executeOrder(primaryLeg);
+
+        if (result.success) {
+          ordersThisCycle++;
+          instance.state.ordersPlaced++;
+          markAutoExecuted(queuedOpp.id);
+          await log(instance, 'trade', 'order', `Order placed: ${result.message}`, {
+            orderId: result.orderId,
+          });
+        } else {
+          await log(instance, 'error', 'order', `Order failed: ${result.message}`);
+        }
       }
 
       // Log decision to session
@@ -328,7 +378,7 @@ async function runCycle(instance: BotInstance) {
           outcome: opp.outcome,
           price: opp.suggestedPrice,
           size,
-          reason: `[${opp.type}] ${opp.reasoning}`,
+          reason: `[auto:${opp.type}] ${opp.reasoning}`,
           confidence: opp.confidence,
         });
       }
@@ -367,7 +417,7 @@ export async function startBot(profileId: string): Promise<BotState> {
   // Create AI session
   const sessionId = await createSession(profileId);
 
-  const intervalMs = await loadScanInterval();
+  const intervalMs = loadScanInterval();
 
   const instance: BotInstance = {
     profileId,

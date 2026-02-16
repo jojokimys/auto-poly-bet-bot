@@ -1,4 +1,3 @@
-import { prisma } from '@/lib/db/prisma';
 import type { Strategy, ScoredOpportunity, BotConfig, StrategySignal } from '../types';
 
 /**
@@ -8,7 +7,7 @@ import type { Strategy, ScoredOpportunity, BotConfig, StrategySignal } from '../
  * prices and Polymarket crypto prediction markets.
  *
  * Key features:
- * - Per-profile position tracking with DB persistence (survives restarts)
+ * - Per-profile position tracking (in-memory)
  * - BUY when market price is dislocated from fair price (undervalued)
  * - SELL when take-profit, stop-loss, time-exit, or dislocation-close triggers
  * - Only enters at extreme prices (≤15c or ≥85c) to minimize fee drag
@@ -31,9 +30,6 @@ interface TrackedPosition {
 /** profileId → (conditionId → TrackedPosition) */
 const positionsByProfile = new Map<string, Map<string, TrackedPosition>>();
 
-/** Track which profiles have been loaded from DB */
-const loadedProfiles = new Set<string>();
-
 /** Get or create the positions map for a profile */
 function getProfilePositions(profileId: string): Map<string, TrackedPosition> {
   let map = positionsByProfile.get(profileId);
@@ -42,86 +38,6 @@ function getProfilePositions(profileId: string): Map<string, TrackedPosition> {
     positionsByProfile.set(profileId, map);
   }
   return map;
-}
-
-/** Load OPEN positions from DB into memory on first call per profile */
-async function ensurePositionsLoaded(profileId: string): Promise<void> {
-  if (loadedProfiles.has(profileId)) return;
-
-  const rows = await prisma.scalperPosition.findMany({
-    where: { profileId, status: 'OPEN' },
-  });
-
-  const map = getProfilePositions(profileId);
-  for (const row of rows) {
-    map.set(row.conditionId, {
-      tokenId: row.tokenId,
-      conditionId: row.conditionId,
-      outcome: row.outcome,
-      entryPrice: row.entryPrice,
-      entryTime: row.entryTime.getTime(),
-      size: row.size,
-      targetPrice: row.targetPrice,
-      stopPrice: row.stopPrice,
-    });
-  }
-
-  loadedProfiles.add(profileId);
-}
-
-/** Persist a new position to DB (non-blocking) */
-function savePosition(profileId: string, pos: TrackedPosition): void {
-  prisma.scalperPosition
-    .upsert({
-      where: {
-        profileId_conditionId: { profileId, conditionId: pos.conditionId },
-      },
-      create: {
-        profileId,
-        conditionId: pos.conditionId,
-        tokenId: pos.tokenId,
-        outcome: pos.outcome,
-        entryPrice: pos.entryPrice,
-        entryTime: new Date(pos.entryTime),
-        size: pos.size,
-        targetPrice: pos.targetPrice,
-        stopPrice: pos.stopPrice,
-        status: 'OPEN',
-      },
-      update: {
-        tokenId: pos.tokenId,
-        outcome: pos.outcome,
-        entryPrice: pos.entryPrice,
-        entryTime: new Date(pos.entryTime),
-        size: pos.size,
-        targetPrice: pos.targetPrice,
-        stopPrice: pos.stopPrice,
-        status: 'OPEN',
-        closedAt: null,
-        closeReason: null,
-      },
-    })
-    .catch((err) => {
-      console.error('[crypto-scalper] savePosition failed:', err);
-    });
-}
-
-/** Mark position as CLOSED in DB (non-blocking) */
-function closePosition(profileId: string, conditionId: string, reason: string): void {
-  prisma.scalperPosition
-    .update({
-      where: {
-        profileId_conditionId: { profileId, conditionId },
-      },
-      data: {
-        status: 'CLOSED',
-        closedAt: new Date(),
-        closeReason: reason,
-      },
-    })
-    .catch((err) => {
-      console.error('[crypto-scalper] closePosition failed:', err);
-    });
 }
 
 /** Expose for testing / debugging */
@@ -149,20 +65,19 @@ function calcFairYesPrice(spotPrice: number, strikePrice: number): number {
 export const cryptoScalperStrategy: Strategy = {
   name: 'crypto-scalper',
 
-  async evaluate(
+  evaluate(
     opp: ScoredOpportunity,
     _config: BotConfig,
     balance: number,
     _openPositionCount: number,
     profileId?: string,
-  ): Promise<StrategySignal | null> {
+  ): StrategySignal | null {
     // Must have crypto scalper data from scanner
     if (opp.spotPrice == null || opp.openingPrice == null) return null;
     if (opp.openingPrice <= 0) return null;
     if (!opp.cryptoAsset) return null;
 
     const pid = profileId ?? '_default';
-    await ensurePositionsLoaded(pid);
     const positions = getProfilePositions(pid);
 
     const minutesToExpiry = opp.hoursToExpiry * 60;
@@ -219,9 +134,8 @@ function evaluateExit(
     return null;
   }
 
-  // Remove tracked position and persist closure
+  // Remove tracked position
   positions.delete(opp.conditionId);
-  closePosition(profileId, opp.conditionId, reason);
 
   return {
     action: 'SELL',
@@ -324,7 +238,7 @@ function evaluateEntry(
   const targetPriceTP = targetPrice + dislocation * 0.5; // 50% of dislocation
   const stopPrice = targetPrice - 0.03;                  // 3c adverse move
 
-  // Track the position in memory and persist to DB
+  // Track the position in memory
   const tracked: TrackedPosition = {
     tokenId: targetTokenId,
     conditionId: opp.conditionId,
@@ -336,7 +250,6 @@ function evaluateEntry(
     stopPrice,
   };
   positions.set(opp.conditionId, tracked);
-  savePosition(profileId, tracked);
 
   return {
     action: 'BUY',

@@ -1,9 +1,10 @@
 import 'server-only';
 
 import { ClobClient } from '@polymarket/clob-client';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { SignatureType } from '@polymarket/order-utils';
 import { Wallet } from '@ethersproject/wallet';
-import { getEnv } from '@/lib/config/env';
+import { getEnv, getBuilderConfig } from '@/lib/config/env';
 import { trackClobCall, trackClobAuthCall } from './api-tracker';
 
 const CHAIN_ID = 137;
@@ -17,6 +18,9 @@ export interface ProfileCredentials {
   apiKey: string;
   apiSecret: string;
   apiPassphrase: string;
+  builderApiKey?: string;
+  builderApiSecret?: string;
+  builderApiPassphrase?: string;
 }
 
 const clientCache = new Map<string, ClobClient>();
@@ -37,6 +41,20 @@ export function getClientForProfile(profile: ProfileCredentials): ClobClient {
   const funder = profile.funderAddress || undefined;
   const sigType = profile.signatureType ?? (funder ? SignatureType.POLY_PROXY : SignatureType.EOA);
 
+  // Profile-level builder creds take priority, then env fallback
+  let builderConfig: BuilderConfig | undefined;
+  if (profile.builderApiKey && profile.builderApiSecret && profile.builderApiPassphrase) {
+    builderConfig = new BuilderConfig({
+      localBuilderCreds: {
+        key: profile.builderApiKey,
+        secret: profile.builderApiSecret,
+        passphrase: profile.builderApiPassphrase,
+      },
+    });
+  } else {
+    builderConfig = getBuilderConfig();
+  }
+
   const client = new ClobClient(
     env.CLOB_API_URL,
     CHAIN_ID,
@@ -44,6 +62,9 @@ export function getClientForProfile(profile: ProfileCredentials): ClobClient {
     creds,
     sigType,
     funder,
+    undefined,      // geoBlockToken
+    undefined,      // useServerTime
+    builderConfig,  // builderConfig
   );
 
   clientCache.set(profile.id, client);
