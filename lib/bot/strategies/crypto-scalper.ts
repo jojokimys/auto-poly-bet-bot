@@ -53,6 +53,7 @@ export function getTrackedPositions(profileId?: string): ReadonlyMap<string, Tra
 // ─── Fair Price Calculator ───────────────────────────────
 
 function calcFairYesPrice(spotPrice: number, strikePrice: number): number {
+  if (!Number.isFinite(spotPrice) || !Number.isFinite(strikePrice)) return 0.5;
   if (strikePrice <= 0) return 0.5;
   const pctFromStrike = (spotPrice - strikePrice) / strikePrice;
   // ±0.4% maps to ~0.02..0.98 range; scale factor 120 for sensitivity

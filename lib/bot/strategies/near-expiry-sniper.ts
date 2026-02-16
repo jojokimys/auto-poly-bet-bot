@@ -28,21 +28,19 @@ export const nearExpirySniperStrategy: Strategy = {
   ): StrategySignal | null {
     // ── STAGE 1: Hard Filters ────────────────────────────
 
-    // Only target high-probability outcomes (90-94 cents)
-    // Above 94c, margin after 2% winner fee is <4c — too thin
-    if (opp.price < 0.90 || opp.price > 0.94) return null;
+    // Target high-probability outcomes (88-97 cents)
+    if (opp.price < 0.88 || opp.price > 0.97) return null;
 
-    // Only target near-expiry markets (1-8 hours)
-    // Accuracy jumps to 95.4% at 4h; beyond 8h it drops to ~88%
-    if (opp.hoursToExpiry < 1 || opp.hoursToExpiry > 8) return null;
+    // Target near-expiry markets (0.5-48 hours)
+    if (opp.hoursToExpiry < 0.5 || opp.hoursToExpiry > 48) return null;
 
-    // Minimum liquidity (raised to avoid slippage eating margin)
-    if (opp.liquidity < 2000) return null;
-    // Minimum volume (higher = better price discovery)
-    if (opp.volume24hr < 5000) return null;
+    // Minimum liquidity
+    if (opp.liquidity < 500) return null;
+    // Minimum volume
+    if (opp.volume24hr < 1000) return null;
 
-    // Maximum spread — tighter to ensure real consensus
-    if (opp.spread > 0.02) return null;
+    // Maximum spread
+    if (opp.spread > 0.03) return null;
 
     // Sum check: yes + no should be approximately 1.00
     const priceSum = opp.yesPrice + opp.noPrice;
@@ -62,18 +60,19 @@ export const nearExpirySniperStrategy: Strategy = {
     let confirmedSignals = 0;
 
     // --- Signal 1: Price Level (0-25 pts) ---
-    const priceScore = ((opp.price - 0.90) / 0.04) * 25;
+    const priceScore = ((opp.price - 0.85) / 0.12) * 25;
     totalScore += Math.min(25, Math.max(0, priceScore));
 
     // --- Signal 2: Time Decay (0-25 pts) ---
     let timeScore = 0;
     if (opp.hoursToExpiry <= 2) timeScore = 25;
-    else if (opp.hoursToExpiry <= 4) timeScore = 22;
-    else if (opp.hoursToExpiry <= 6) timeScore = 18;
-    else timeScore = 12;
+    else if (opp.hoursToExpiry <= 6) timeScore = 22;
+    else if (opp.hoursToExpiry <= 12) timeScore = 18;
+    else if (opp.hoursToExpiry <= 24) timeScore = 14;
+    else timeScore = 10;
     totalScore += timeScore;
 
-    if (timeScore >= 18) confirmedSignals++; // Confirmed if <= 6h
+    if (timeScore >= 14) confirmedSignals++; // Confirmed if <= 24h
 
     // --- Signal 3: Price Momentum (0-20 pts) ---
     let momentumScore = 0;
@@ -148,7 +147,7 @@ export const nearExpirySniperStrategy: Strategy = {
 
     // ── STAGE 4: Position Sizing ─────────────────────────
 
-    const maxPerTrade = balance * 0.05; // 5% of portfolio
+    const maxPerTrade = balance * 0.08; // 8% of portfolio
 
     // Confidence-based sizing
     const confidence = Math.min(1.0, totalScore / 80);
@@ -156,7 +155,7 @@ export const nearExpirySniperStrategy: Strategy = {
 
     // All-signals bonus
     if (confirmedSignals === 4) {
-      targetCost = Math.min(targetCost * 1.2, balance * 0.07);
+      targetCost = Math.min(targetCost * 1.2, balance * 0.10);
     }
 
     // Place at current price — for near-expiry we want fills, not discount
@@ -166,6 +165,11 @@ export const nearExpirySniperStrategy: Strategy = {
     if (size <= 0) return null;
 
     const expectedReturn = ((EFFECTIVE_PAYOUT - limitPrice) / limitPrice) * 100;
+
+    // Auto-execute: high-probability + short-expiry + strong confirmation
+    const isAutoExecutable = opp.price >= 0.93
+      && opp.hoursToExpiry <= 4
+      && confirmedSignals >= 3;
 
     return {
       action: 'BUY',
@@ -181,8 +185,10 @@ export const nearExpirySniperStrategy: Strategy = {
         `score ${totalScore.toFixed(0)}/100`,
         `signals ${confirmedSignals}/4`,
         `return ~${expectedReturn.toFixed(1)}%`,
+        isAutoExecutable ? 'AUTO' : 'MANUAL',
       ].join(', '),
       score: totalScore,
+      autoExecutable: isAutoExecutable,
     };
   },
 };

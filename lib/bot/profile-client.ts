@@ -1,9 +1,10 @@
 import 'server-only';
 
-import { ClobClient } from '@polymarket/clob-client';
+import { ClobClient, type TickSize } from '@polymarket/clob-client';
 import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { SignatureType } from '@polymarket/order-utils';
 import { Wallet } from '@ethersproject/wallet';
+import { prisma } from '@/lib/db/prisma';
 import { getEnv, getBuilderConfig } from '@/lib/config/env';
 import { trackClobCall, trackClobAuthCall } from './api-tracker';
 
@@ -21,6 +22,25 @@ export interface ProfileCredentials {
   builderApiKey?: string;
   builderApiSecret?: string;
   builderApiPassphrase?: string;
+}
+
+/** Load profile credentials from DB. Shared helper to avoid duplicate loading. */
+export async function loadProfile(profileId: string): Promise<ProfileCredentials | null> {
+  const p = await prisma.botProfile.findUnique({ where: { id: profileId } });
+  if (!p) return null;
+  return {
+    id: p.id,
+    name: p.name,
+    privateKey: p.privateKey,
+    funderAddress: p.funderAddress,
+    signatureType: p.signatureType,
+    apiKey: p.apiKey,
+    apiSecret: p.apiSecret,
+    apiPassphrase: p.apiPassphrase,
+    builderApiKey: p.builderApiKey,
+    builderApiSecret: p.builderApiSecret,
+    builderApiPassphrase: p.builderApiPassphrase,
+  };
 }
 
 const clientCache = new Map<string, ClobClient>();
@@ -106,17 +126,36 @@ export async function getProfileOpenOrders(profile: ProfileCredentials) {
   return orders as any[];
 }
 
+// ─── Token metadata cache (tickSize + negRisk) ──────────
+// TTL-based cache to avoid redundant CLOB API calls per token
+const TOKEN_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const tokenMetaCache = new Map<string, { tickSize: TickSize; negRisk: boolean; expiresAt: number }>();
+
+async function getTokenMeta(client: ClobClient, tokenId: string): Promise<{ tickSize: TickSize; negRisk: boolean }> {
+  const cached = tokenMetaCache.get(tokenId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { tickSize: cached.tickSize, negRisk: cached.negRisk };
+  }
+
+  trackClobAuthCall(); // getTickSize
+  trackClobAuthCall(); // getNegRisk
+  const [tickSize, negRisk] = await Promise.all([
+    client.getTickSize(tokenId),
+    client.getNegRisk(tokenId),
+  ]);
+
+  tokenMetaCache.set(tokenId, { tickSize, negRisk, expiresAt: Date.now() + TOKEN_META_TTL_MS });
+  return { tickSize, negRisk };
+}
+
 /** Place an order for a specific profile */
 export async function placeProfileOrder(
   profile: ProfileCredentials,
   params: { tokenId: string; side: 'BUY' | 'SELL'; price: number; size: number }
 ) {
-  trackClobAuthCall(); // getTickSize
-  trackClobAuthCall(); // getNegRisk
   trackClobAuthCall(); // createAndPostOrder
   const client = getClientForProfile(profile);
-  const tickSize = await client.getTickSize(params.tokenId);
-  const negRisk = await client.getNegRisk(params.tokenId);
+  const { tickSize, negRisk } = await getTokenMeta(client, params.tokenId);
 
   return client.createAndPostOrder(
     {

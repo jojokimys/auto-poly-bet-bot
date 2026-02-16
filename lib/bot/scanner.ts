@@ -1,55 +1,10 @@
 import 'server-only';
 
 import { fetchMarkets, fetchEvents } from '@/lib/polymarket/gamma';
-import { getEnv } from '@/lib/config/env';
-import { getBtcPrice, getCryptoPrice, type CryptoSymbol } from '@/lib/polymarket/binance';
+import { getCryptoPrice, type CryptoSymbol } from '@/lib/polymarket/binance';
 import type { GammaMarket } from '@/lib/types/polymarket';
 import type { BotConfig, ScoredOpportunity } from './types';
 import { trackGammaCall } from './api-tracker';
-
-// ─── CLOB Order Book Helper ─────────────────────────────
-
-interface OrderBookLevel {
-  price: string;
-  size: string;
-}
-
-interface OrderBookResponse {
-  asks: OrderBookLevel[];
-  bids: OrderBookLevel[];
-}
-
-/**
- * Fetch CLOB order book for a given token ID.
- * Returns best ask price and dollar depth at best ask.
- */
-async function fetchOrderBook(
-  tokenId: string,
-): Promise<{ bestAsk: number; askDepth: number } | null> {
-  try {
-    const clobUrl = getEnv().CLOB_API_URL;
-    const res = await fetch(`${clobUrl}/book?token_id=${tokenId}`, {
-      cache: 'no-store',
-    });
-    if (!res.ok) return null;
-
-    const book: OrderBookResponse = await res.json();
-    if (!book.asks || book.asks.length === 0) return null;
-
-    // Asks are sorted ascending by price
-    const bestAsk = parseFloat(book.asks[0].price);
-    // Calculate dollar depth at best ask level
-    let askDepth = 0;
-    for (const level of book.asks) {
-      if (parseFloat(level.price) > bestAsk + 0.01) break; // within 1c of best
-      askDepth += parseFloat(level.price) * parseFloat(level.size);
-    }
-
-    return { bestAsk, askDepth };
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Score a market for trading opportunity.
@@ -66,11 +21,12 @@ function scoreMarket(gm: GammaMarket): ScoredOpportunity | null {
   let tokenIds: string[] = [];
 
   try {
-    const prices: number[] = JSON.parse(gm.outcomePrices || '[]');
+    const prices = JSON.parse(gm.outcomePrices || '[]');
     outcomes = JSON.parse(gm.outcomes || '[]');
     tokenIds = JSON.parse(gm.clobTokenIds || '[]');
-    yesPrice = prices[0] || 0;
-    noPrice = prices[1] || 0;
+    // Gamma API returns prices as strings ("0.91"), must convert to numbers
+    yesPrice = Number(prices[0]) || 0;
+    noPrice = Number(prices[1]) || 0;
   } catch {
     return null;
   }
@@ -192,6 +148,7 @@ export async function scanNearExpiryMarkets(
     limit,
     order: 'endDate',
     ascending: true,
+    endDateMin: new Date().toISOString(),
   });
 
   const scored: ScoredOpportunity[] = [];
@@ -200,12 +157,12 @@ export async function scanNearExpiryMarkets(
     const opp = scoreMarket(gm);
     if (!opp) continue;
 
-    // Near-expiry specific filters (tightened based on accuracy research)
-    if (opp.hoursToExpiry < 1 || opp.hoursToExpiry > 8) continue;
-    if (opp.price < 0.90 || opp.price > 0.94) continue;
-    if (opp.liquidity < 2000) continue;
-    if (opp.volume24hr < 5000) continue;
-    if (opp.spread > 0.02) continue;
+    // Near-expiry specific filters (0.5-48h window, 85-97c range)
+    if (opp.hoursToExpiry < 0.5 || opp.hoursToExpiry > 48) continue;
+    if (opp.price < 0.85 || opp.price > 0.97) continue;
+    if (opp.liquidity < 500) continue;
+    if (opp.volume24hr < 1000) continue;
+    if (opp.spread > 0.03) continue;
 
     scored.push(opp);
   }
@@ -238,6 +195,7 @@ export async function scanMicroScalpMarkets(
     limit,
     order: 'endDate',
     ascending: true,
+    endDateMin: new Date().toISOString(),
   });
 
   const scored: ScoredOpportunity[] = [];
@@ -250,8 +208,8 @@ export async function scanMicroScalpMarkets(
     const minutesToExpiry = opp.hoursToExpiry * 60;
     if (minutesToExpiry < 5 || minutesToExpiry > 60) continue;
     if (opp.price < 0.93 || opp.price > 0.97) continue;
-    if (opp.liquidity < 2000) continue;
-    if (opp.volume24hr < 5000) continue;
+    if (opp.liquidity < 500) continue;
+    if (opp.volume24hr < 100) continue;
     if (opp.spread > 0.02) continue;
 
     scored.push(opp);
@@ -287,7 +245,6 @@ export async function scanComplementArbMarkets(
     const opp = scoreMarket(gm);
     if (!opp) continue;
 
-    // Must be a binary market with 2 tokens
     let tokenIds: string[] = [];
     try {
       tokenIds = JSON.parse(gm.clobTokenIds || '[]');
@@ -296,31 +253,21 @@ export async function scanComplementArbMarkets(
     }
     if (tokenIds.length < 2) continue;
 
-    const yesTokenId = tokenIds[0];
-    const noTokenId = tokenIds[1];
+    // Use Gamma mid-prices instead of CLOB order books
+    const combinedCost = opp.yesPrice + opp.noPrice;
+    if (combinedCost >= 0.975) continue;
 
-    // Fetch order books for both sides
-    const [yesBook, noBook] = await Promise.all([
-      fetchOrderBook(yesTokenId),
-      fetchOrderBook(noTokenId),
-    ]);
-
-    if (!yesBook || !noBook) continue;
-
-    // Filter: combined ask must be < $0.975
-    if (yesBook.bestAsk + noBook.bestAsk >= 0.975) continue;
-
-    // Filter: sufficient depth on both sides (≥$50)
-    if (yesBook.askDepth < 50 || noBook.askDepth < 50) continue;
+    const depthProxy = opp.liquidity / 2;
+    if (depthProxy < 50) continue;
 
     scored.push({
       ...opp,
-      yesTokenId,
-      noTokenId,
-      yesBestAsk: yesBook.bestAsk,
-      noBestAsk: noBook.bestAsk,
-      askDepthYes: yesBook.askDepth,
-      askDepthNo: noBook.askDepth,
+      yesTokenId: tokenIds[0],
+      noTokenId: tokenIds[1],
+      yesBestAsk: opp.yesPrice,
+      noBestAsk: opp.noPrice,
+      askDepthYes: depthProxy,
+      askDepthNo: depthProxy,
     });
   }
 
@@ -373,7 +320,7 @@ export async function scanPanicReversalMarkets(
 }
 
 // Crypto keyword patterns for market question matching
-const CRYPTO_KEYWORDS = /\b(btc|bitcoin|crypto)\b/i;
+const CRYPTO_KEYWORDS = /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto)\b/i;
 
 /**
  * Scan for crypto latency arb opportunities.
@@ -390,15 +337,11 @@ export async function scanCryptoLatencyMarkets(
     limit,
     order: 'endDate',
     ascending: true,
+    endDateMin: new Date().toISOString(),
   });
 
-  // Fetch Binance BTC price once
-  let btcPrice: number;
-  try {
-    btcPrice = await getBtcPrice();
-  } catch {
-    return []; // Can't proceed without spot price
-  }
+  // Fetch spot prices lazily per detected asset
+  const spotPriceCache = new Map<CryptoSymbol, number>();
 
   const scored: ScoredOpportunity[] = [];
 
@@ -406,8 +349,18 @@ export async function scanCryptoLatencyMarkets(
     // Must match crypto keywords
     if (!CRYPTO_KEYWORDS.test(gm.question)) continue;
 
+    // Detect which crypto asset this market is about
+    const detected = detectCryptoAsset(gm.question);
+    if (!detected) continue;
+
     const opp = scoreMarket(gm);
     if (!opp) continue;
+
+    // Override hoursToExpiry for 5-min window markets (endDate is ~24h, not actual expiry)
+    const parsedEnd = parseCryptoMarketEndTime(gm.question);
+    if (parsedEnd) {
+      opp.hoursToExpiry = Math.max(0, (parsedEnd.getTime() - Date.now()) / (1000 * 60 * 60));
+    }
 
     // Must be short-duration (< 1 hour to expiry)
     if (opp.hoursToExpiry > 1) continue;
@@ -423,18 +376,27 @@ export async function scanCryptoLatencyMarkets(
     }
     if (tokenIds.length < 2) continue;
 
-    // Try to extract opening price from question (e.g., "Will BTC be above $97,500 at 3:00 PM?")
-    const priceMatch = gm.question.match(/\$?([\d,]+(?:\.\d+)?)/);
-    const openingPrice = priceMatch
-      ? parseFloat(priceMatch[1].replace(/,/g, ''))
-      : 0;
+    // Fetch spot price (cached per symbol)
+    if (!spotPriceCache.has(detected.symbol)) {
+      try {
+        const price = await getCryptoPrice(detected.symbol);
+        spotPriceCache.set(detected.symbol, price);
+      } catch {
+        continue;
+      }
+    }
+    const spotPrice = spotPriceCache.get(detected.symbol)!;
+
+    // Try to extract strike price from question (e.g., "Will BTC be above $97,500 at 3:00 PM?")
+    const openingPrice = extractStrikePrice(gm.question) ?? 0;
 
     scored.push({
       ...opp,
       yesTokenId: tokenIds[0],
       noTokenId: tokenIds[1],
-      spotPrice: btcPrice,
+      spotPrice,
       openingPrice,
+      cryptoAsset: detected.asset,
     });
   }
 
@@ -484,16 +446,16 @@ export async function scanMultiOutcomeArbMarkets(
 
     for (const gm of activeMarkets) {
       try {
-        const prices: number[] = JSON.parse(gm.outcomePrices || '[]');
+        const rawPrices = JSON.parse(gm.outcomePrices || '[]');
         const tokenIds: string[] = JSON.parse(gm.clobTokenIds || '[]');
         const outcomes: string[] = JSON.parse(gm.outcomes || '[]');
 
-        if (prices.length < 1 || tokenIds.length < 1 || outcomes.length < 1) {
+        if (rawPrices.length < 1 || tokenIds.length < 1 || outcomes.length < 1) {
           validEvent = false;
           break;
         }
 
-        const yesPrice = prices[0] || 0;
+        const yesPrice = Number(rawPrices[0]) || 0;
         gammaSum += yesPrice;
 
         legs.push({
@@ -515,38 +477,21 @@ export async function scanMultiOutcomeArbMarkets(
     // Validate winner-take-all: sum of YES prices should be roughly 0.85-1.15
     if (gammaSum < 0.85 || gammaSum > 1.15) continue;
 
-    // Quick check: if Gamma sum already >= 0.975, CLOB asks won't be cheaper
-    // (Gamma prices are usually mid-market; asks are higher)
-    // Skip this check to be safe — CLOB asks can sometimes be lower than Gamma mid
-    // Just proceed to fetch order books
-
-    // Fetch CLOB order books for all YES tokens in parallel
-    const bookResults = await Promise.all(
-      legs.map((leg) => fetchOrderBook(leg.yesTokenId)),
-    );
-
-    // Check that all books are available
-    const allBooksValid = bookResults.every((b) => b !== null);
-    if (!allBooksValid) continue;
-
-    const books = bookResults as { bestAsk: number; askDepth: number }[];
-
-    // Sum all YES best asks
-    const bundleCost = books.reduce((sum, b) => sum + b.bestAsk, 0);
-
-    // Must be under $0.975 for profitable arb (net 0.5c+ after 2% winner fee)
+    // Use Gamma mid-prices instead of CLOB order books
+    const bundleCost = gammaSum;
     if (bundleCost >= 0.975) continue;
 
-    // Every leg must have at least $25 ask depth
-    if (books.some((b) => b.askDepth < 25)) continue;
+    // Every leg must have at least $25 depth (proxy: liquidity / 2)
+    const minDepth = Math.min(...legs.map((l) => l.liquidity / 2));
+    if (minDepth < 25) continue;
 
     // Build bundle legs data
-    const bundleLegs = legs.map((leg, i) => ({
+    const bundleLegs = legs.map((leg) => ({
       tokenId: leg.yesTokenId,
       outcome: 'Yes',
       marketQuestion: leg.question,
-      bestAsk: books[i].bestAsk,
-      askDepth: books[i].askDepth,
+      bestAsk: leg.yesGammaPrice,
+      askDepth: leg.liquidity / 2,
     }));
 
     // Total event volume and liquidity
@@ -561,7 +506,7 @@ export async function scanMultiOutcomeArbMarkets(
       question: event.title,
       tokenId: primary.yesTokenId,
       outcome: 'Yes',
-      price: books[0].bestAsk,
+      price: primary.yesGammaPrice,
       yesPrice: primary.yesGammaPrice,
       noPrice: 1 - primary.yesGammaPrice,
       volume24hr: totalVolume,
@@ -603,8 +548,55 @@ function detectCryptoAsset(question: string): { symbol: CryptoSymbol; asset: str
 }
 
 function extractStrikePrice(question: string): number | null {
-  const match = question.match(/\$?([\d,]+(?:\.\d+)?)/);
-  return match ? parseFloat(match[1].replace(/,/g, '')) : null;
+  // Require $ prefix to avoid matching date numbers like "February 16"
+  const match = question.match(/\$([\d,]+(?:\.\d+)?)/);
+  if (!match) return null;
+  const val = parseFloat(match[1].replace(/,/g, ''));
+  return Number.isFinite(val) ? val : null;
+}
+
+/**
+ * Parse actual end time from crypto market questions with explicit time ranges.
+ * e.g. "Bitcoin Up or Down - February 17, 3:45AM-3:50AM ET" → 3:50AM ET on Feb 17
+ * Returns null if no time range found (e.g. daily "Up or Down on February 16?" markets).
+ */
+function parseCryptoMarketEndTime(question: string): Date | null {
+  // Match: "Month Day, startTime-endTime timezone"
+  const match = question.match(
+    /(\w+)\s+(\d{1,2}),?\s+\d{1,2}:\d{2}\s*(?:AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)\s*(ET|EST|EDT|CT|PT|UTC)/i,
+  );
+  if (!match) return null;
+
+  const [, monthStr, dayStr, endHourStr, endMinStr, ampm, tz] = match;
+
+  const monthMap: Record<string, number> = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+  };
+  const month = monthMap[monthStr.toLowerCase()];
+  if (month === undefined) return null;
+
+  let hour = parseInt(endHourStr);
+  if (ampm.toUpperCase() === 'PM' && hour !== 12) hour += 12;
+  if (ampm.toUpperCase() === 'AM' && hour === 12) hour = 0;
+
+  // Timezone offset from UTC (hours)
+  const tzOffsets: Record<string, number> = {
+    ET: 5, EST: 5, EDT: 4, CT: 6, PT: 8, UTC: 0,
+  };
+  const offset = tzOffsets[tz.toUpperCase()] ?? 5;
+
+  const year = new Date().getFullYear();
+  const date = new Date(
+    Date.UTC(year, month, parseInt(dayStr), hour + offset, parseInt(endMinStr)),
+  );
+
+  // If date is >24h in the past, assume next year
+  if (date.getTime() < Date.now() - 24 * 60 * 60 * 1000) {
+    date.setFullYear(year + 1);
+  }
+
+  return date;
 }
 
 /**
@@ -623,6 +615,7 @@ export async function scanCryptoScalperMarkets(
     limit,
     order: 'endDate',
     ascending: true,
+    endDateMin: new Date().toISOString(),
   });
 
   // Group markets by asset, fetch spot prices once per asset
@@ -636,6 +629,12 @@ export async function scanCryptoScalperMarkets(
 
     const opp = scoreMarket(gm);
     if (!opp) continue;
+
+    // Override hoursToExpiry for 5-min window markets (endDate is ~24h, not actual expiry)
+    const parsedEnd = parseCryptoMarketEndTime(gm.question);
+    if (parsedEnd) {
+      opp.hoursToExpiry = Math.max(0, (parsedEnd.getTime() - Date.now()) / (1000 * 60 * 60));
+    }
 
     // Expiry: 2 min to 60 min range
     const minutesToExpiry = opp.hoursToExpiry * 60;
@@ -678,3 +677,5 @@ export async function scanCryptoScalperMarkets(
 
   return scored;
 }
+
+

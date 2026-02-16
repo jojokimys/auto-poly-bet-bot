@@ -14,7 +14,7 @@ export interface QueuedOpportunity {
   autoExecutable: boolean;
 }
 
-// ─── Queue ──────────────────────────────────────────────
+// ─── Queue (globalThis to survive Next.js HMR) ─────────
 
 const MAX_QUEUE_SIZE = 50;
 
@@ -24,11 +24,29 @@ const TIME_WINDOW_MS: Record<Opportunity['timeWindow'], number> = {
   hours: 60 * 60 * 1000,    // 1 hour
 };
 
-const queue: QueuedOpportunity[] = [];
+const EXECUTED_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour cooldown after execution
+
+const globalForQueue = globalThis as unknown as {
+  __opportunityQueue: QueuedOpportunity[];
+  __opportunityPendingKeys: Set<string>;
+  __executedCooldowns: Map<string, number>;
+};
+globalForQueue.__opportunityQueue ??= [];
+globalForQueue.__opportunityPendingKeys ??= new Set<string>();
+globalForQueue.__executedCooldowns ??= new Map<string, number>();
+
+const queue = globalForQueue.__opportunityQueue;
+const pendingKeys = globalForQueue.__opportunityPendingKeys;
+const executedCooldowns = globalForQueue.__executedCooldowns;
 
 /** Dedupe key: same conditionId + strategy = same opportunity */
 function dedupeKey(opp: Opportunity): string {
   return `${opp.conditionId}:${opp.type}`;
+}
+
+/** Cooldown key: conditionId only — block ALL strategies on same market after execution */
+function cooldownKey(opp: Opportunity): string {
+  return opp.conditionId;
 }
 
 // ─── Public API ─────────────────────────────────────────
@@ -39,10 +57,12 @@ export function addOpportunity(opp: Opportunity): QueuedOpportunity | null {
 
   // Check for duplicate (same conditionId + strategy type)
   const key = dedupeKey(opp);
-  const existing = queue.find(
-    (q) => dedupeKey(q.opportunity) === key && q.status === 'pending',
-  );
-  if (existing) return null;
+  if (pendingKeys.has(key)) return null;
+
+  // Check cooldown — block re-entry on same market after recent execution
+  const cdKey = cooldownKey(opp);
+  const cdExpiry = executedCooldowns.get(cdKey);
+  if (cdExpiry && Date.now() < cdExpiry) return null;
 
   const now = Date.now();
   const ttl = TIME_WINDOW_MS[opp.timeWindow] ?? TIME_WINDOW_MS.hours;
@@ -58,10 +78,14 @@ export function addOpportunity(opp: Opportunity): QueuedOpportunity | null {
   };
 
   queue.push(entry);
+  pendingKeys.add(key);
 
   // FIFO: remove oldest if over limit
   while (queue.length > MAX_QUEUE_SIZE) {
-    queue.shift();
+    const removed = queue.shift();
+    if (removed && removed.status === 'pending') {
+      pendingKeys.delete(dedupeKey(removed.opportunity));
+    }
   }
 
   return entry;
@@ -81,6 +105,9 @@ export function approveOpportunity(id: string): QueuedOpportunity | null {
   const entry = queue.find((q) => q.id === id);
   if (!entry || entry.status !== 'pending') return null;
   entry.status = 'approved';
+  pendingKeys.delete(dedupeKey(entry.opportunity));
+  // Cooldown: prevent same market re-entry
+  executedCooldowns.set(cooldownKey(entry.opportunity), Date.now() + EXECUTED_COOLDOWN_MS);
   return entry;
 }
 
@@ -88,6 +115,7 @@ export function rejectOpportunity(id: string): QueuedOpportunity | null {
   const entry = queue.find((q) => q.id === id);
   if (!entry || entry.status !== 'pending') return null;
   entry.status = 'rejected';
+  pendingKeys.delete(dedupeKey(entry.opportunity));
   return entry;
 }
 
@@ -95,15 +123,25 @@ export function markAutoExecuted(id: string): QueuedOpportunity | null {
   const entry = queue.find((q) => q.id === id);
   if (!entry || entry.status !== 'pending') return null;
   entry.status = 'auto-executed';
+  pendingKeys.delete(dedupeKey(entry.opportunity));
+  // Cooldown: prevent same market re-entry
+  executedCooldowns.set(cooldownKey(entry.opportunity), Date.now() + EXECUTED_COOLDOWN_MS);
   return entry;
 }
 
 export function expireStale(): number {
   const now = Date.now();
   let expired = 0;
+
+  // Clean expired cooldowns
+  for (const [key, expiry] of executedCooldowns) {
+    if (now >= expiry) executedCooldowns.delete(key);
+  }
+
   for (const entry of queue) {
     if (entry.status === 'pending' && now >= entry.expiresAt) {
       entry.status = 'expired';
+      pendingKeys.delete(dedupeKey(entry.opportunity));
       expired++;
     }
   }
@@ -112,6 +150,8 @@ export function expireStale(): number {
 
 export function clearQueue(): void {
   queue.length = 0;
+  pendingKeys.clear();
+  executedCooldowns.clear();
 }
 
 export function getQueueStats() {

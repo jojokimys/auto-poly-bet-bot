@@ -40,11 +40,15 @@ export const valueBettingStrategy: Strategy = {
     const limitPrice = Math.max(0.01, opp.price - limitDiscount);
     const size = targetCost / limitPrice;
 
-    // Expected value estimate:
-    // If the favored outcome wins, payout is $1/share, cost is limitPrice
-    // Edge = (probability of win * $1 - limitPrice) / limitPrice
-    // Use price as a rough probability proxy
-    const impliedEdge = (opp.price - limitPrice) / limitPrice;
+    // Expected value estimate (fee-adjusted):
+    // Payout is $0.98/share after 2% winner fee, cost is limitPrice
+    // Edge = (price * 0.98 - limitPrice) / limitPrice
+    const EFFECTIVE_PAYOUT = 0.98;
+    const expectedPayout = opp.price * EFFECTIVE_PAYOUT;
+    const impliedEdge = (expectedPayout - limitPrice) / limitPrice;
+
+    // Reject if edge <= 0 after fees (would be a losing trade)
+    if (impliedEdge <= 0) return null;
 
     return {
       action: 'BUY',

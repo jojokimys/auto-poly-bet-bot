@@ -13,11 +13,6 @@ export function checkRisk(
   openPositionCount: number,
   totalExposure: number
 ): RiskCheckResult {
-  // Check max open positions
-  if (openPositionCount >= config.maxOpenPositions) {
-    return { allowed: false, reason: `Max open positions reached (${config.maxOpenPositions})` };
-  }
-
   // Check portfolio exposure limit
   const maxExposureAmount = balance * config.maxPortfolioExposure;
   const remainingExposure = maxExposureAmount - totalExposure;

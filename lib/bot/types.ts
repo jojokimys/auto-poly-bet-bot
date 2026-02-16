@@ -7,26 +7,23 @@ export interface BotConfig {
   maxSpread: number;
   scanIntervalSeconds: number;
   minScore: number;
-  maxOpenPositions: number;
   maxPortfolioExposure: number; // fraction of balance
 }
 
 /**
- * Tuned for a ~$100 USDC starting bankroll.
- * - $5 max per trade (5% risk per position)
- * - 5 open positions max ($25 total exposure cap)
- * - 30% portfolio exposure ceiling
- * - Conservative scoring threshold (60+)
+ * Tuned for a ~$285 USDC bankroll.
+ * - $25 max per trade (~8.8% risk per position)
+ * - 40% portfolio exposure ceiling (overridable per-profile)
+ * - 15s scan interval for faster opportunity capture
  */
 export const DEFAULT_BOT_CONFIG: BotConfig = {
-  maxBetAmount: 5,
+  maxBetAmount: 25,
   minLiquidity: 1000,
   minVolume: 5000,
   maxSpread: 0.05,
-  scanIntervalSeconds: 30,
+  scanIntervalSeconds: 15,
   minScore: 60,
-  maxOpenPositions: 5,
-  maxPortfolioExposure: 0.3,
+  maxPortfolioExposure: 0.4,
 };
 
 export type BotStatus = 'stopped' | 'running' | 'error';
@@ -103,6 +100,8 @@ export interface StrategySignal {
   size: number;
   reason: string;
   score: number;
+  /** Strategy can flag this signal as auto-executable (overrides registry default) */
+  autoExecutable?: boolean;
   /** Second leg for complement arb (opposing token order) */
   secondLeg?: {
     tokenId: string;

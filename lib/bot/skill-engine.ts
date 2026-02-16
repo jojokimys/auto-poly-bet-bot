@@ -1,7 +1,7 @@
 import 'server-only';
 
 import { prisma } from '@/lib/db/prisma';
-import { clearProfileClient } from './profile-client';
+import { clearProfileClient, loadProfile } from './profile-client';
 import {
   addOpportunity,
   getAutoExecutableOpportunities,
@@ -10,7 +10,6 @@ import {
 } from './opportunity-queue';
 import { getPositions } from '@/lib/skills/position-monitor';
 import { getRiskAssessment } from '@/lib/skills/risk-manager';
-import { explore } from '@/lib/skills/explorer';
 import { executeOrder, executeArbOrder } from '@/lib/skills/order-manager';
 import { executeEarlyExits } from '@/lib/skills/early-exit';
 import {
@@ -19,7 +18,11 @@ import {
   incrementCycle,
   logDecision,
 } from '@/lib/skills/reporter';
+import { getStrategyEntry } from './strategy-registry';
+import { signalToOpportunity } from './signal-converter';
+import { DEFAULT_BOT_CONFIG } from './types';
 import type { BotState, BotLogEntry } from './types';
+import type { Opportunity } from '@/lib/skills/types';
 
 const MAX_LOG_BUFFER = 200;
 const MAX_ORDERS_PER_CYCLE = 3;
@@ -90,10 +93,8 @@ async function log(
 
 // ─── Config ──────────────────────────────────────────────
 
-const DEFAULT_SCAN_INTERVAL_MS = 30 * 1000;
-
 function loadScanInterval(): number {
-  return DEFAULT_SCAN_INTERVAL_MS;
+  return DEFAULT_BOT_CONFIG.scanIntervalSeconds * 1000;
 }
 
 // ─── Cycle Loop ──────────────────────────────────────────
@@ -147,16 +148,26 @@ async function runCycle(instance: BotInstance) {
   try {
     await log(instance, 'info', 'scan', `Cycle #${cycleNum} starting`);
 
-    // ── Phase 1: Briefing ──
-    const [positions, risk] = await Promise.all([
-      getPositions(instance.profileId),
-      getRiskAssessment(instance.profileId),
-    ]);
-
-    if (!positions || !risk) {
+    // ── Phase 0: Load profile once for entire cycle ──
+    const profile = await loadProfile(instance.profileId);
+    if (!profile) {
       await log(instance, 'error', 'error', 'Profile not found, stopping');
       instance.state.status = 'error';
       instance.state.error = 'Profile not found';
+      return;
+    }
+
+    // ── Phase 1: Briefing (reuse profile) ──
+    const dbProfile = await prisma.botProfile.findUnique({
+      where: { id: instance.profileId },
+      select: { maxPortfolioExposure: true },
+    });
+    const positions = await getPositions(instance.profileId, profile);
+    const risk = await getRiskAssessment(instance.profileId, profile, positions!, dbProfile?.maxPortfolioExposure ?? undefined);
+
+    if (!positions || !risk) {
+      await log(instance, 'error', 'error', 'Failed to load positions/risk');
+      instance.state.error = 'Position data unavailable';
       return;
     }
 
@@ -185,7 +196,7 @@ async function runCycle(instance: BotInstance) {
 
     // ── Phase 1.5: Early Exit ──
     try {
-      const exitResult = await executeEarlyExits(instance.profileId);
+      const exitResult = await executeEarlyExits(instance.profileId, undefined, profile);
       if (exitResult.summary.totalExecuted > 0) {
         await log(instance, 'trade', 'early-exit', `Early exit: sold ${exitResult.summary.totalExecuted} near-confirmed positions, freed ~$${exitResult.summary.capitalFreed.toFixed(2)}`, {
           candidates: exitResult.candidates.map(c => ({
@@ -216,6 +227,7 @@ async function runCycle(instance: BotInstance) {
               size: ex.size,
               reason: `[early-exit] Sold near-confirmed winner at $${ex.price} (entry: $${candidate?.avgEntryPrice ?? '?'})`,
               confidence: 95,
+              strategy: 'early-exit',
             });
           }
         }
@@ -227,22 +239,82 @@ async function runCycle(instance: BotInstance) {
       await log(instance, 'warn', 'early-exit', `Early exit scan failed: ${msg}`);
     }
 
-    // ── Phase 2: Recon ──
-    const exploreResult = await explore('all');
-    const opportunities = exploreResult.opportunities;
+    // ── Phase 2: Multi-Strategy Scan + Evaluate (parallel) ──
+    const enabledStrategies = await loadEnabledStrategies(instance.profileId);
+    const config = loadConfig();
+    const opportunities: Opportunity[] = [];
+    let totalMarketsScanned = 0;
 
-    instance.state.marketsScanned += exploreResult.marketConditions.totalActiveMarkets;
+    // Resolve strategy entries, filter unknown
+    const strategyEntries = enabledStrategies
+      .map((name) => ({ name, entry: getStrategyEntry(name) }))
+      .filter((s): s is { name: string; entry: NonNullable<ReturnType<typeof getStrategyEntry>> } => {
+        if (!s.entry) {
+          log(instance, 'warn', 'scan', `Unknown strategy: ${s.name}, skipping`).catch(() => {});
+          return false;
+        }
+        return true;
+      });
+
+    // Run all strategy scans in parallel
+    const scanResults = await Promise.allSettled(
+      strategyEntries.map(async ({ name, entry }) => {
+        const scored = await entry.scan(config);
+
+        // Evaluate all scored opportunities in parallel within this strategy
+        const signals = await Promise.all(
+          scored.map(async (opp) => {
+            const signal = await entry.strategy.evaluate(
+              opp,
+              config,
+              positions.balance,
+              positions.summary.totalPositions,
+              instance.profileId,
+            );
+            return signal ? signalToOpportunity(signal, entry, opp) : null;
+          }),
+        );
+
+        return { name, scored, opportunities: signals.filter((s): s is Opportunity => s !== null) };
+      }),
+    );
+
+    // Collect results from all parallel scans
+    for (const result of scanResults) {
+      if (result.status === 'fulfilled') {
+        const { name, scored, opportunities: stratOpps } = result.value;
+        totalMarketsScanned += scored.length;
+        opportunities.push(...stratOpps);
+        await log(instance, 'info', 'scan', `[${name}] Scanned ${scored.length} markets → ${stratOpps.length} signals`);
+      } else {
+        const msg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        await log(instance, 'warn', 'scan', `Strategy scan failed: ${msg}`);
+      }
+    }
+
+    // Sort by confidence DESC
+    opportunities.sort((a, b) => b.confidence - a.confidence);
+
+    instance.state.marketsScanned += totalMarketsScanned;
     instance.state.opportunitiesFound += opportunities.length;
     instance.state.lastScanAt = new Date().toISOString();
 
-    await log(instance, 'info', 'scan', `Found ${opportunities.length} opportunities across ${exploreResult.marketConditions.totalActiveMarkets} markets`, {
-      top3: opportunities.slice(0, 3).map((o) => ({
-        type: o.type,
-        q: o.question.slice(0, 50),
-        conf: o.confidence,
-        profit: o.expectedProfit.toFixed(3),
-      })),
-    });
+    await log(instance, 'info', 'scan', `Found ${opportunities.length} opportunities from ${enabledStrategies.length} strategies`);
+
+    if (opportunities.length > 0) {
+      console.table(opportunities.map((o) => ({
+        strategy: o.type,
+        question: o.question.slice(0, 60),
+        confidence: o.confidence,
+        signal: o.signal,
+        price: o.suggestedPrice,
+        size: o.suggestedSize,
+        profit: +o.expectedProfit.toFixed(3),
+        risk: o.riskLevel,
+        timeWindow: o.timeWindow,
+        autoExec: o.autoExecutable,
+      })));
+    }
 
     if (opportunities.length === 0) {
       if (instance.sessionId) {
@@ -278,7 +350,6 @@ async function runCycle(instance: BotInstance) {
 
     for (const queuedOpp of autoOpps) {
       if (ordersThisCycle >= MAX_ORDERS_PER_CYCLE) break;
-      if (ordersThisCycle >= risk.limits.remainingCapacity) break;
 
       const opp = queuedOpp.opportunity;
 
@@ -336,7 +407,7 @@ async function runCycle(instance: BotInstance) {
           })),
         ];
 
-        const arbResult = await executeArbOrder(allLegs);
+        const arbResult = await executeArbOrder(allLegs, profile);
 
         if (arbResult.success) {
           ordersThisCycle++;
@@ -352,7 +423,7 @@ async function runCycle(instance: BotInstance) {
         }
       } else {
         // Single-leg (fallback)
-        const result = await executeOrder(primaryLeg);
+        const result = await executeOrder(primaryLeg, profile);
 
         if (result.success) {
           ordersThisCycle++;
@@ -380,6 +451,7 @@ async function runCycle(instance: BotInstance) {
           size,
           reason: `[auto:${opp.type}] ${opp.reasoning}`,
           confidence: opp.confidence,
+          strategy: opp.type,
         });
       }
     }
@@ -397,6 +469,26 @@ async function runCycle(instance: BotInstance) {
     await log(instance, 'error', 'error', `Cycle #${cycleNum} failed: ${msg}`);
     instance.state.error = msg;
   }
+}
+
+// ─── Helpers ─────────────────────────────────────────────
+
+async function loadEnabledStrategies(profileId: string): Promise<string[]> {
+  const profile = await prisma.botProfile.findUnique({
+    where: { id: profileId },
+    select: { enabledStrategies: true },
+  });
+  if (!profile) return ['value-betting'];
+  try {
+    const parsed = JSON.parse(profile.enabledStrategies);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : ['value-betting'];
+  } catch {
+    return ['value-betting'];
+  }
+}
+
+function loadConfig() {
+  return DEFAULT_BOT_CONFIG;
 }
 
 // ─── Public API ──────────────────────────────────────────
