@@ -1,26 +1,11 @@
 import 'server-only';
 
 import { prisma } from '@/lib/db/prisma';
-import { placeProfileOrder, type ProfileCredentials } from '@/lib/bot/profile-client';
-import type { OrderRequest, OrderResult } from './types';
+import { loadProfile, placeProfileOrder, type ProfileCredentials } from '@/lib/bot/profile-client';
+import type { OrderRequest, OrderResult, ArbOrderResult } from './types';
 
-async function loadProfile(profileId: string): Promise<ProfileCredentials | null> {
-  const p = await prisma.botProfile.findUnique({ where: { id: profileId } });
-  if (!p) return null;
-  return {
-    id: p.id,
-    name: p.name,
-    privateKey: p.privateKey,
-    funderAddress: p.funderAddress,
-    signatureType: p.signatureType,
-    apiKey: p.apiKey,
-    apiSecret: p.apiSecret,
-    apiPassphrase: p.apiPassphrase,
-  };
-}
-
-export async function executeOrder(req: OrderRequest): Promise<OrderResult> {
-  const profile = await loadProfile(req.profileId);
+export async function executeOrder(req: OrderRequest, cachedProfile?: ProfileCredentials): Promise<OrderResult> {
+  const profile = cachedProfile ?? await loadProfile(req.profileId);
   if (!profile) {
     return { success: false, message: `Profile not found: ${req.profileId}` };
   }
@@ -50,6 +35,25 @@ export async function executeOrder(req: OrderRequest): Promise<OrderResult> {
       },
     });
 
+    // Check if CLOB API returned an error
+    const clobError = (result as any)?.error;
+    if (clobError) {
+      await prisma.botLog.create({
+        data: {
+          profileId: req.profileId,
+          level: 'error',
+          event: 'ai-order-clob-error',
+          message: `CLOB rejected: ${clobError} (status ${(result as any)?.status})`,
+          data: JSON.stringify({ conditionId: req.conditionId, clobResponse: result }),
+        },
+      });
+      return {
+        success: false,
+        orderId,
+        message: `CLOB error: ${clobError}`,
+      };
+    }
+
     return {
       success: true,
       orderId,
@@ -70,4 +74,39 @@ export async function executeOrder(req: OrderRequest): Promise<OrderResult> {
 
     return { success: false, message };
   }
+}
+
+/**
+ * Execute all legs of an arb order in parallel.
+ * All legs must succeed for a true arb; partial fills create directional risk.
+ */
+export async function executeArbOrder(legs: OrderRequest[], cachedProfile?: ProfileCredentials): Promise<ArbOrderResult> {
+  if (legs.length === 0) {
+    return { success: false, results: [], message: 'No legs provided' };
+  }
+
+  const results = await Promise.all(legs.map(leg => executeOrder(leg, cachedProfile)));
+  const succeeded = results.filter(r => r.success).length;
+  const allSuccess = succeeded === legs.length;
+
+  if (!allSuccess && succeeded > 0) {
+    // Partial fill — log warning (directional exposure risk)
+    await prisma.botLog.create({
+      data: {
+        profileId: legs[0].profileId,
+        level: 'warn',
+        event: 'arb-partial-fill',
+        message: `Arb partial fill: ${succeeded}/${legs.length} legs succeeded. Directional exposure risk!`,
+        data: JSON.stringify(results),
+      },
+    });
+  }
+
+  return {
+    success: allSuccess,
+    results,
+    message: allSuccess
+      ? `Arb complete: ${legs.length} legs filled`
+      : `Arb partial: ${succeeded}/${legs.length} legs filled`,
+  };
 }

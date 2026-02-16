@@ -4,6 +4,82 @@ import { prisma } from '@/lib/db/prisma';
 import { getDashboardData } from '@/lib/polymarket/analytics';
 import type { PerformanceData } from './types';
 
+// ─── Per-Strategy Performance ────────────────────────────
+
+export interface StrategyPerformance {
+  strategy: string;
+  totalDecisions: number;
+  trades: number;
+  skips: number;
+  avgConfidence: number;
+  successRate: number;
+  totalPnl: number;
+}
+
+export async function getStrategyPerformance(
+  profileId: string,
+  strategy: string,
+  period: string = 'all',
+): Promise<StrategyPerformance> {
+  const periodMs: Record<string, number> = {
+    '1d': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+    '30d': 30 * 24 * 60 * 60 * 1000,
+  };
+
+  const since = period !== 'all' && periodMs[period]
+    ? new Date(Date.now() - periodMs[period])
+    : undefined;
+
+  const decisions = await prisma.aiDecision.findMany({
+    where: {
+      profileId,
+      strategy,
+      ...(since ? { createdAt: { gte: since } } : {}),
+    },
+  });
+
+  const trades = decisions.filter((d) => d.type === 'trade');
+  const successes = trades.filter((d) => d.result === 'success');
+  const totalPnl = decisions.reduce((sum, d) => sum + (d.pnl ?? 0), 0);
+  const avgConfidence =
+    decisions.length > 0
+      ? decisions.reduce((sum, d) => sum + d.confidence, 0) / decisions.length
+      : 0;
+
+  return {
+    strategy,
+    totalDecisions: decisions.length,
+    trades: trades.length,
+    skips: decisions.filter((d) => d.type === 'skip').length,
+    avgConfidence: Math.round(avgConfidence),
+    successRate: trades.length > 0 ? successes.length / trades.length : 0,
+    totalPnl,
+  };
+}
+
+export async function getAllStrategyPerformance(
+  profileId: string,
+  period: string = 'all',
+): Promise<StrategyPerformance[]> {
+  // Get all distinct strategies from decisions
+  const decisions = await prisma.aiDecision.findMany({
+    where: { profileId, strategy: { not: null } },
+    select: { strategy: true },
+    distinct: ['strategy'],
+  });
+
+  const strategies = decisions
+    .map((d) => d.strategy)
+    .filter((s): s is string => s !== null);
+
+  return Promise.all(
+    strategies.map((s) => getStrategyPerformance(profileId, s, period)),
+  );
+}
+
+// ─── Overall Performance ────────────────────────────────
+
 export async function getPerformance(
   profileId: string,
   period: string = 'all',

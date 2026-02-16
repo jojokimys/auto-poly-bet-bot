@@ -1,38 +1,22 @@
 import 'server-only';
 
-import { prisma } from '@/lib/db/prisma';
 import {
   getProfileBalance,
   getProfileOpenOrders,
+  loadProfile,
   type ProfileCredentials,
 } from '@/lib/bot/profile-client';
+import { getNetPositions } from './early-exit';
 import type { PositionData } from './types';
 
-async function loadProfile(profileId: string): Promise<ProfileCredentials | null> {
-  const p = await prisma.botProfile.findUnique({ where: { id: profileId } });
-  if (!p) return null;
-  return {
-    id: p.id,
-    name: p.name,
-    privateKey: p.privateKey,
-    funderAddress: p.funderAddress,
-    signatureType: p.signatureType,
-    apiKey: p.apiKey,
-    apiSecret: p.apiSecret,
-    apiPassphrase: p.apiPassphrase,
-  };
-}
-
-export async function getPositions(profileId: string): Promise<PositionData | null> {
-  const profile = await loadProfile(profileId);
+export async function getPositions(profileId: string, cachedProfile?: ProfileCredentials): Promise<PositionData | null> {
+  const profile = cachedProfile ?? await loadProfile(profileId);
   if (!profile) return null;
 
-  const [balance, openOrders, scalperPositions] = await Promise.all([
+  const [balance, openOrders, netPositions] = await Promise.all([
     getProfileBalance(profile),
     getProfileOpenOrders(profile),
-    prisma.scalperPosition.findMany({
-      where: { profileId, status: 'OPEN' },
-    }),
+    getNetPositions(profile),
   ]);
 
   const parsedOrders = (openOrders || []).map((o: any) => ({
@@ -45,32 +29,34 @@ export async function getPositions(profileId: string): Promise<PositionData | nu
     tokenId: o.asset_id || '',
   }));
 
-  const parsedScalper = scalperPositions.map(sp => ({
-    conditionId: sp.conditionId,
-    outcome: sp.outcome,
-    entryPrice: sp.entryPrice,
-    size: sp.size,
-    targetPrice: sp.targetPrice,
-    stopPrice: sp.stopPrice,
-    holdTimeMinutes: Math.round((Date.now() - sp.entryTime.getTime()) / 60000),
+  const heldPositions = Array.from(netPositions.values()).map(p => ({
+    tokenId: p.tokenId,
+    conditionId: p.conditionId,
+    outcome: p.outcome,
+    netSize: p.netSize,
+    avgEntryPrice: p.avgEntryPrice,
+    totalCost: Math.round(p.totalCost * 100) / 100,
   }));
 
   const orderExposure = parsedOrders.reduce((sum: number, o: any) => sum + o.price * o.size, 0);
-  const scalperExposure = parsedScalper.reduce((sum, sp) => sum + sp.entryPrice * sp.size, 0);
-  const totalExposure = orderExposure + scalperExposure;
+  const heldExposure = heldPositions.reduce((sum, hp) => sum + hp.avgEntryPrice * hp.netSize, 0);
+  const totalExposure = orderExposure + heldExposure;
+
+  // balance = free USDC (after LIVE order locks). Total portfolio includes locked USDC.
+  const totalPortfolio = balance + orderExposure;
 
   return {
     profileId,
     profileName: profile.name,
     balance,
     openOrders: parsedOrders,
-    scalperPositions: parsedScalper,
+    heldPositions,
     exposure: {
       total: Math.round(totalExposure * 100) / 100,
-      percentage: balance > 0 ? Math.round((totalExposure / balance) * 10000) / 100 : 0,
+      percentage: totalPortfolio > 0 ? Math.round((totalExposure / totalPortfolio) * 10000) / 100 : 0,
     },
     summary: {
-      totalPositions: parsedOrders.length + parsedScalper.length,
+      totalPositions: heldPositions.length,
       totalExposure: Math.round(totalExposure * 100) / 100,
     },
   };

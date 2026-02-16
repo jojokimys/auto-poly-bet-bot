@@ -3,18 +3,20 @@ import 'server-only';
 import { prisma } from '@/lib/db/prisma';
 import { getPositions } from './position-monitor';
 import { DEFAULT_BOT_CONFIG } from '@/lib/bot/types';
-import type { RiskData, RiskLevel } from './types';
+import type { ProfileCredentials } from '@/lib/bot/profile-client';
+import type { RiskData, RiskLevel, PositionData } from './types';
 
-export async function getRiskAssessment(profileId: string): Promise<RiskData | null> {
-  const positions = await getPositions(profileId);
+export async function getRiskAssessment(profileId: string, cachedProfile?: ProfileCredentials, cachedPositions?: PositionData, maxPortfolioExposure?: number): Promise<RiskData | null> {
+  const positions = cachedPositions ?? await getPositions(profileId, cachedProfile);
   if (!positions) return null;
 
   const config = DEFAULT_BOT_CONFIG;
-  const { balance, exposure, openOrders, scalperPositions } = positions;
+  const effectiveExposure = maxPortfolioExposure ?? config.maxPortfolioExposure;
+  const { balance, exposure } = positions;
 
   // Compute exposure percent
   const exposurePercent = exposure.percentage;
-  const maxExposurePercent = config.maxPortfolioExposure * 100;
+  const maxExposurePercent = effectiveExposure * 100;
 
   // Estimate drawdown from recent AI decisions
   const recentDecisions = await prisma.aiDecision.findMany({
@@ -52,12 +54,7 @@ export async function getRiskAssessment(profileId: string): Promise<RiskData | n
     warnings.push(`Low balance: $${balance.toFixed(2)}`);
   }
 
-  const totalPositions = openOrders.length + scalperPositions.length;
-  const canTrade = riskLevel !== 'CRITICAL' && balance >= 1 && totalPositions < config.maxOpenPositions;
-
-  if (totalPositions >= config.maxOpenPositions) {
-    warnings.push(`Max open positions reached (${totalPositions}/${config.maxOpenPositions})`);
-  }
+  const canTrade = riskLevel !== 'CRITICAL' && balance >= 1;
 
   return {
     profileId,
@@ -75,8 +72,6 @@ export async function getRiskAssessment(profileId: string): Promise<RiskData | n
     warnings,
     limits: {
       maxPositionSize: config.maxBetAmount,
-      maxOpenPositions: config.maxOpenPositions,
-      remainingCapacity: Math.max(0, config.maxOpenPositions - totalPositions),
     },
   };
 }

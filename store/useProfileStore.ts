@@ -6,8 +6,10 @@ export interface ProfilePublic {
   funderAddress: string;
   hasPrivateKey: boolean;
   hasApiCredentials: boolean;
+  hasBuilderCredentials: boolean;
   isActive: boolean;
-  strategy: string;
+  enabledStrategies: string[];
+  maxPortfolioExposure: number;
   createdAt: string;
 }
 
@@ -19,7 +21,7 @@ interface ProfileState {
   success: string | null;
 
   fetchProfiles: () => Promise<void>;
-  createProfile: (data: Record<string, string>) => Promise<boolean>;
+  createProfile: (data: Record<string, unknown>) => Promise<boolean>;
   updateProfile: (id: string, data: Record<string, unknown>) => Promise<boolean>;
   deleteProfile: (id: string) => Promise<boolean>;
   clearMessages: () => void;
@@ -44,7 +46,7 @@ export const useProfileStore = create<ProfileState>((set) => ({
     }
   },
 
-  createProfile: async (data) => {
+  createProfile: async (data: Record<string, unknown>) => {
     set({ saving: true, error: null, success: null });
     try {
       const res = await fetch('/api/profiles', {

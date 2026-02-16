@@ -48,14 +48,13 @@ export interface PositionData {
     status: string;
     tokenId: string;
   }[];
-  scalperPositions: {
+  heldPositions: {
+    tokenId: string;
     conditionId: string;
     outcome: string;
-    entryPrice: number;
-    size: number;
-    targetPrice: number;
-    stopPrice: number;
-    holdTimeMinutes: number;
+    netSize: number;
+    avgEntryPrice: number;
+    totalCost: number;
   }[];
   exposure: { total: number; percentage: number };
   summary: { totalPositions: number; totalExposure: number };
@@ -74,7 +73,7 @@ export interface RiskData {
   drawdown: { current: number; maxAllowed: number; peakBalance: number };
   canTrade: boolean;
   warnings: string[];
-  limits: { maxPositionSize: number; maxOpenPositions: number; remainingCapacity: number };
+  limits: { maxPositionSize: number };
 }
 
 // Order Manager
@@ -92,6 +91,12 @@ export interface OrderRequest {
 export interface OrderResult {
   success: boolean;
   orderId?: string;
+  message: string;
+}
+
+export interface ArbOrderResult {
+  success: boolean;
+  results: OrderResult[];
   message: string;
 }
 
@@ -123,6 +128,14 @@ export interface PerformanceData {
 }
 
 // Explorer
+export interface ArbLeg {
+  conditionId: string;
+  tokenId: string;
+  outcome: string;
+  price: number;
+  size: number;
+}
+
 export interface Opportunity {
   type: string;
   conditionId: string;
@@ -138,6 +151,12 @@ export interface Opportunity {
   timeWindow: 'urgent' | 'minutes' | 'hours';
   riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
   dataPoints: Record<string, unknown>;
+  /** Whether this opportunity can be auto-executed without Claude's approval (arb strategies) */
+  autoExecutable: boolean;
+  /** Detailed strategy score breakdown */
+  strategyScore?: number;
+  /** Additional legs for arb execution (complement-arb, multi-outcome-arb) */
+  arbLegs?: ArbLeg[];
 }
 
 export interface ExploreData {

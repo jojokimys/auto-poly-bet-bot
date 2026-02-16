@@ -50,6 +50,7 @@ export async function logDecision(params: {
   size?: number;
   reason: string;
   confidence: number;
+  strategy?: string;
 }) {
   return prisma.aiDecision.create({ data: params });
 }
