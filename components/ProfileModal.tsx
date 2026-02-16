@@ -9,10 +9,13 @@ import {
   ModalFooter,
   Input,
   Button,
-  Select,
-  SelectItem,
+  Checkbox,
+  CheckboxGroup,
+  Slider,
+  Chip,
 } from '@heroui/react';
 import { useProfileStore, type ProfilePublic } from '@/store/useProfileStore';
+import { STRATEGY_META } from '@/lib/bot/strategy-meta';
 
 interface ProfileModalProps {
   isOpen: boolean;
@@ -20,17 +23,6 @@ interface ProfileModalProps {
   profile?: ProfilePublic | null;
   onSaved: () => void;
 }
-
-const STRATEGIES = [
-  { key: 'value-betting', label: 'Value Betting' },
-  { key: 'near-expiry-sniper', label: 'Near Expiry Sniper' },
-  { key: 'micro-scalper', label: 'Micro Scalper' },
-  { key: 'complement-arb', label: 'Complement Arb' },
-  { key: 'panic-reversal', label: 'Panic Reversal' },
-  { key: 'crypto-latency', label: 'Crypto Latency Arb' },
-  { key: 'multi-outcome-arb', label: 'Multi-Outcome Arb' },
-  { key: 'crypto-scalper', label: 'Crypto Scalper' },
-];
 
 export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModalProps) {
   const { createProfile, updateProfile, saving, error, success, clearMessages, fetchProfiles } =
@@ -48,12 +40,17 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
     builderApiKey: '',
     builderApiSecret: '',
     builderApiPassphrase: '',
-    strategy: 'value-betting',
+    enabledStrategies: ['value-betting'] as string[],
+    maxPortfolioExposure: 40, // percent
   });
 
   const [localError, setLocalError] = useState<string | null>(null);
   const [deriving, setDeriving] = useState(false);
   const [deriveSuccess, setDeriveSuccess] = useState<string | null>(null);
+
+  // Whether API keys exist (derived or pre-existing)
+  const hasApiKeys = !!(form.apiKey && form.apiSecret && form.apiPassphrase);
+  const apiKeysConfigured = hasApiKeys || (isEditMode && profile?.hasApiCredentials);
 
   // Reset form when modal opens or profile changes
   useEffect(() => {
@@ -72,7 +69,8 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
           builderApiKey: '',
           builderApiSecret: '',
           builderApiPassphrase: '',
-          strategy: profile.strategy || 'value-betting',
+          enabledStrategies: profile.enabledStrategies?.length ? profile.enabledStrategies : ['value-betting'],
+          maxPortfolioExposure: Math.round((profile.maxPortfolioExposure ?? 0.4) * 100),
         });
       } else {
         setForm({
@@ -85,7 +83,8 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
           builderApiKey: '',
           builderApiSecret: '',
           builderApiPassphrase: '',
-          strategy: 'value-betting',
+          enabledStrategies: ['value-betting'],
+          maxPortfolioExposure: 40,
         });
       }
     }
@@ -95,8 +94,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
     setLocalError(null);
     setDeriveSuccess(null);
 
-    // Edit mode: can use stored private key if user didn't enter a new one
-    // Create mode: must enter private key
     if (!isEditMode && !form.privateKey) {
       setLocalError('Enter your private key first to derive API credentials');
       return;
@@ -111,7 +108,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
       const payload: Record<string, string> = {};
       if (form.privateKey) payload.privateKey = form.privateKey;
       if (form.funderAddress) payload.funderAddress = form.funderAddress;
-      // Edit mode: pass profileId so server saves derived keys to DB directly
       if (isEditMode && profile) payload.profileId = profile.id;
 
       const res = await fetch('/api/profiles/derive-keys', {
@@ -127,7 +123,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
         return;
       }
 
-      // Fill form fields with derived credentials
       setForm((f) => ({
         ...f,
         apiKey: data.apiKey,
@@ -138,12 +133,10 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
       const addr = `${data.walletAddress.slice(0, 6)}...${data.walletAddress.slice(-4)}`;
 
       if (data.profile) {
-        // Edit mode: keys were saved to DB, refresh store
         await fetchProfiles();
         onSaved();
         setDeriveSuccess(`API keys derived and saved for ${addr}`);
       } else {
-        // Create mode: keys filled in form, user needs to save profile
         setDeriveSuccess(`API keys derived for ${addr} — save profile to apply`);
       }
     } catch (err) {
@@ -167,25 +160,14 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
       return;
     }
 
-    if (!isEditMode && !form.apiKey) {
-      setLocalError('API key is required for new profiles');
-      return;
-    }
-
-    if (!isEditMode && !form.apiSecret) {
-      setLocalError('API secret is required for new profiles');
-      return;
-    }
-
-    if (!isEditMode && !form.apiPassphrase) {
-      setLocalError('API passphrase is required for new profiles');
+    if (!isEditMode && !hasApiKeys) {
+      setLocalError('Click "Setup API Keys" to derive credentials before saving');
       return;
     }
 
     let ok = false;
 
     if (isEditMode && profile) {
-      // Only send changed fields
       const data: Record<string, unknown> = { name: form.name.trim() };
       if (form.privateKey) data.privateKey = form.privateKey;
       if (form.funderAddress) data.funderAddress = form.funderAddress;
@@ -195,16 +177,18 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
       if (form.builderApiKey) data.builderApiKey = form.builderApiKey;
       if (form.builderApiSecret) data.builderApiSecret = form.builderApiSecret;
       if (form.builderApiPassphrase) data.builderApiPassphrase = form.builderApiPassphrase;
-      data.strategy = form.strategy;
+      data.enabledStrategies = form.enabledStrategies;
+      data.maxPortfolioExposure = form.maxPortfolioExposure / 100;
       ok = await updateProfile(profile.id, data);
     } else {
-      const data: Record<string, string> = {
+      const data: Record<string, unknown> = {
         name: form.name.trim(),
         privateKey: form.privateKey,
         apiKey: form.apiKey,
         apiSecret: form.apiSecret,
         apiPassphrase: form.apiPassphrase,
-        strategy: form.strategy,
+        enabledStrategies: form.enabledStrategies,
+        maxPortfolioExposure: form.maxPortfolioExposure / 100,
       };
       if (form.funderAddress) data.funderAddress = form.funderAddress;
       if (form.builderApiKey) data.builderApiKey = form.builderApiKey;
@@ -245,13 +229,10 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             onValueChange={(v) => setForm((f) => ({ ...f, name: v }))}
           />
 
-          {/* Wallet Keys Section */}
+          {/* Wallet + API Keys Section */}
           <div className="space-y-3">
             <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
               Wallet Configuration
-              {isEditMode && profile?.hasPrivateKey && (
-                <span className="ml-2 text-xs text-success">Configured</span>
-              )}
             </p>
             <Input
               type="password"
@@ -274,17 +255,18 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
               onValueChange={(v) => setForm((f) => ({ ...f, funderAddress: v }))}
               description="Polymarket proxy wallet address (optional)"
             />
-          </div>
 
-          {/* API Keys Section */}
-          <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                API Credentials
-                {isEditMode && profile?.hasApiCredentials && (
-                  <span className="ml-2 text-xs text-success">Configured</span>
-                )}
-              </p>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-gray-700 dark:text-gray-300">API Credentials</span>
+                <Chip
+                  size="sm"
+                  variant="flat"
+                  color={apiKeysConfigured ? 'success' : 'warning'}
+                >
+                  {apiKeysConfigured ? 'Configured' : 'Not set'}
+                </Chip>
+              </div>
               <Button
                 size="sm"
                 color="secondary"
@@ -293,41 +275,13 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
                 onPress={handleDeriveKeys}
                 isDisabled={!form.privateKey && !(isEditMode && profile?.hasPrivateKey)}
               >
-                {deriving ? 'Deriving...' : 'Setup API Keys'}
+                {deriving ? 'Deriving...' : apiKeysConfigured ? 'Re-derive' : 'Setup API Keys'}
               </Button>
             </div>
 
             {deriveSuccess && (
               <p className="text-xs text-success">{deriveSuccess}</p>
             )}
-
-            <Input
-              label="API Key"
-              placeholder={isEditMode && profile?.hasApiCredentials ? '••••••••' : 'Enter API key'}
-              variant="bordered"
-              value={form.apiKey}
-              onValueChange={(v) => setForm((f) => ({ ...f, apiKey: v }))}
-            />
-            <Input
-              type="password"
-              label="API Secret"
-              placeholder={
-                isEditMode && profile?.hasApiCredentials ? '••••••••' : 'Enter API secret'
-              }
-              variant="bordered"
-              value={form.apiSecret}
-              onValueChange={(v) => setForm((f) => ({ ...f, apiSecret: v }))}
-            />
-            <Input
-              type="password"
-              label="API Passphrase"
-              placeholder={
-                isEditMode && profile?.hasApiCredentials ? '••••••••' : 'Enter passphrase'
-              }
-              variant="bordered"
-              value={form.apiPassphrase}
-              onValueChange={(v) => setForm((f) => ({ ...f, apiPassphrase: v }))}
-            />
           </div>
 
           {/* Builder API Credentials Section */}
@@ -381,19 +335,52 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             />
           </div>
 
-          <Select
-            label="Strategy"
-            variant="bordered"
-            selectedKeys={[form.strategy]}
-            onSelectionChange={(keys) => {
-              const selected = Array.from(keys)[0] as string;
-              if (selected) setForm((f) => ({ ...f, strategy: selected }));
-            }}
-          >
-            {STRATEGIES.map((s) => (
-              <SelectItem key={s.key}>{s.label}</SelectItem>
-            ))}
-          </Select>
+          {/* Portfolio Exposure Limit */}
+          <div className="space-y-2">
+            <Slider
+              label="Max Portfolio Exposure"
+              step={5}
+              minValue={10}
+              maxValue={100}
+              value={form.maxPortfolioExposure}
+              onChange={(v) =>
+                setForm((f) => ({ ...f, maxPortfolioExposure: v as number }))
+              }
+              getValue={(v) => `${v}%`}
+              className="max-w-full"
+              size="sm"
+            />
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Maximum percentage of balance that can be used for open positions
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Enabled Strategies
+            </p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Select one or more strategies for this profile to run
+            </p>
+            <CheckboxGroup
+              value={form.enabledStrategies}
+              onValueChange={(values) =>
+                setForm((f) => ({
+                  ...f,
+                  enabledStrategies: values.length > 0 ? values : ['value-betting'],
+                }))
+              }
+            >
+              {STRATEGY_META.map((s) => (
+                <Checkbox key={s.key} value={s.key} size="sm">
+                  <span className="text-sm">{s.label}</span>
+                  <span className="text-xs text-gray-500 dark:text-gray-400 ml-1.5">
+                    — {s.description}
+                  </span>
+                </Checkbox>
+              ))}
+            </CheckboxGroup>
+          </div>
 
           {displayError && (
             <p className="text-sm text-danger">{displayError}</p>

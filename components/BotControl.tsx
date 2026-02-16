@@ -263,7 +263,7 @@ export function BotControl() {
                         {profile.name}
                       </span>
                       <span className="text-[10px] text-gray-400">
-                        {profile.strategy === 'value-betting' ? 'Value' : 'Sniper'}
+                        {profile.enabledStrategies.length === 1 ? profile.enabledStrategies[0] : `${profile.enabledStrategies.length} strategies`}
                       </span>
                     </div>
                   </TableCell>

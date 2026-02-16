@@ -15,6 +15,7 @@ import {
   useDisclosure,
 } from '@heroui/react';
 import { useProfileStore, type ProfilePublic } from '@/store/useProfileStore';
+import { STRATEGY_LABELS } from '@/lib/bot/strategy-meta';
 
 interface ProfileCardProps {
   profile: ProfilePublic;
@@ -44,17 +45,7 @@ function formatTime(iso: string): string {
 }
 
 function strategyLabel(strategy: string): string {
-  const labels: Record<string, string> = {
-    'value-betting': 'Value Betting',
-    'near-expiry-sniper': 'Near Expiry Sniper',
-    'micro-scalper': 'Micro Scalper',
-    'complement-arb': 'Complement Arb',
-    'panic-reversal': 'Panic Reversal',
-    'crypto-latency': 'Crypto Latency Arb',
-    'multi-outcome-arb': 'Multi-Outcome Arb',
-    'crypto-scalper': 'Crypto Scalper',
-  };
-  return labels[strategy] || strategy;
+  return STRATEGY_LABELS[strategy] || strategy;
 }
 
 export function ProfileCard({
@@ -115,13 +106,16 @@ export function ProfileCard({
         <CardBody className="pt-0 space-y-3">
           {/* Configuration chips */}
           <div className="flex flex-wrap gap-1.5">
-            <Chip
-              size="sm"
-              variant="flat"
-              color="secondary"
-            >
-              {strategyLabel(profile.strategy)}
-            </Chip>
+            {profile.enabledStrategies.map((s) => (
+              <Chip
+                key={s}
+                size="sm"
+                variant="flat"
+                color="secondary"
+              >
+                {strategyLabel(s)}
+              </Chip>
+            ))}
             <Chip size="sm" variant="flat" color={profile.hasPrivateKey ? 'success' : 'warning'}>
               {profile.hasPrivateKey ? 'Wallet configured' : 'Wallet not set'}
             </Chip>
