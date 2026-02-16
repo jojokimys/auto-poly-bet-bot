@@ -17,6 +17,7 @@ const updateProfileSchema = z.object({
   builderApiPassphrase: z.string().optional(),
   isActive: z.boolean().optional(),
   enabledStrategies: z.array(z.string()).optional(),
+  maxPortfolioExposure: z.number().min(0.1).max(1.0).optional(),
 });
 
 interface ProfilePublicResponse {
@@ -28,6 +29,7 @@ interface ProfilePublicResponse {
   hasBuilderCredentials: boolean;
   isActive: boolean;
   enabledStrategies: string[];
+  maxPortfolioExposure: number;
   createdAt: string;
 }
 
@@ -44,6 +46,7 @@ function toPublic(profile: {
   builderApiPassphrase: string;
   isActive: boolean;
   enabledStrategies: string;
+  maxPortfolioExposure: number;
   createdAt: Date;
 }): ProfilePublicResponse {
   let strategies: string[];
@@ -61,6 +64,7 @@ function toPublic(profile: {
     hasBuilderCredentials: !!(profile.builderApiKey && profile.builderApiSecret && profile.builderApiPassphrase),
     isActive: profile.isActive,
     enabledStrategies: strategies,
+    maxPortfolioExposure: profile.maxPortfolioExposure,
     createdAt: profile.createdAt.toISOString(),
   };
 }
@@ -129,6 +133,7 @@ export async function PUT(
     if (data.builderApiPassphrase !== undefined) updateData.builderApiPassphrase = data.builderApiPassphrase;
     if (data.isActive !== undefined) updateData.isActive = data.isActive;
     if (data.enabledStrategies !== undefined) updateData.enabledStrategies = JSON.stringify(data.enabledStrategies);
+    if (data.maxPortfolioExposure !== undefined) updateData.maxPortfolioExposure = data.maxPortfolioExposure;
 
     const profile = await prisma.botProfile.update({
       where: { id },

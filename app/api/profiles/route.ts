@@ -14,6 +14,7 @@ const createProfileSchema = z.object({
   builderApiSecret: z.string().optional().default(''),
   builderApiPassphrase: z.string().optional().default(''),
   enabledStrategies: z.array(z.string()).optional().default(['value-betting']),
+  maxPortfolioExposure: z.number().min(0.1).max(1.0).optional().default(0.4),
 });
 
 interface ProfilePublicResponse {
@@ -25,6 +26,7 @@ interface ProfilePublicResponse {
   hasBuilderCredentials: boolean;
   isActive: boolean;
   enabledStrategies: string[];
+  maxPortfolioExposure: number;
   createdAt: string;
 }
 
@@ -41,6 +43,7 @@ function toPublic(profile: {
   builderApiPassphrase: string;
   isActive: boolean;
   enabledStrategies: string;
+  maxPortfolioExposure: number;
   createdAt: Date;
 }): ProfilePublicResponse {
   let strategies: string[];
@@ -58,6 +61,7 @@ function toPublic(profile: {
     hasBuilderCredentials: !!(profile.builderApiKey && profile.builderApiSecret && profile.builderApiPassphrase),
     isActive: profile.isActive,
     enabledStrategies: strategies,
+    maxPortfolioExposure: profile.maxPortfolioExposure,
     createdAt: profile.createdAt.toISOString(),
   };
 }
