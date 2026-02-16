@@ -57,31 +57,3 @@ export interface BotStatus {
   opportunitiesFound: number;
 }
 
-export interface BotSettings {
-  id: string;
-  // Wallet
-  privateKey: string;
-  funderAddress: string;
-  // API credentials
-  apiKey: string;
-  apiSecret: string;
-  apiPassphrase: string;
-  // Bot config
-  maxBetAmount: number;
-  minLiquidity: number;
-  minVolume: number;
-  maxSpread: number;
-  autoBettingEnabled: boolean;
-  scanIntervalSeconds: number;
-  // Timestamps
-  updatedAt: string;
-}
-
-/** What we expose to the frontend (no secrets) */
-export type BotSettingsPublic = Omit<
-  BotSettings,
-  'privateKey' | 'apiSecret' | 'apiPassphrase'
-> & {
-  hasPrivateKey: boolean;
-  hasApiCredentials: boolean;
-};

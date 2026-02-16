@@ -1,14 +1,11 @@
 import { z } from 'zod';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 
 const envSchema = z.object({
-  // Polymarket Wallet
-  PRIVATE_KEY: z.string().default(''),
-  FUNDER_ADDRESS: z.string().default(''),
-
-  // Polymarket API Credentials
-  POLY_API_KEY: z.string().default(''),
-  POLY_API_SECRET: z.string().default(''),
-  POLY_API_PASSPHRASE: z.string().default(''),
+  // Builder API Credentials (from builders.polymarket.com)
+  POLY_BUILDER_API_KEY: z.string().default(''),
+  POLY_BUILDER_API_SECRET: z.string().default(''),
+  POLY_BUILDER_API_PASSPHRASE: z.string().default(''),
 
   // Endpoints
   CLOB_API_URL: z.string().url().default('https://clob.polymarket.com'),
@@ -28,12 +25,28 @@ export function getEnv(): Env {
   return cachedEnv;
 }
 
-export function hasTradeCredentials(): boolean {
+let cachedBuilderConfig: BuilderConfig | undefined | null = null;
+
+/** Returns a BuilderConfig if builder API credentials are configured, otherwise undefined. */
+export function getBuilderConfig(): BuilderConfig | undefined {
+  if (cachedBuilderConfig !== null) return cachedBuilderConfig;
+
   const env = getEnv();
-  return !!(
-    env.PRIVATE_KEY &&
-    env.POLY_API_KEY &&
-    env.POLY_API_SECRET &&
-    env.POLY_API_PASSPHRASE
-  );
+  if (
+    env.POLY_BUILDER_API_KEY &&
+    env.POLY_BUILDER_API_SECRET &&
+    env.POLY_BUILDER_API_PASSPHRASE
+  ) {
+    cachedBuilderConfig = new BuilderConfig({
+      localBuilderCreds: {
+        key: env.POLY_BUILDER_API_KEY,
+        secret: env.POLY_BUILDER_API_SECRET,
+        passphrase: env.POLY_BUILDER_API_PASSPHRASE,
+      },
+    });
+  } else {
+    cachedBuilderConfig = undefined;
+  }
+
+  return cachedBuilderConfig;
 }
