@@ -7,6 +7,7 @@ import { Wallet } from '@ethersproject/wallet';
 import { prisma } from '@/lib/db/prisma';
 import { getEnv, getBuilderConfig } from '@/lib/config/env';
 import { trackClobCall, trackClobAuthCall } from './api-tracker';
+import { fetchBestBidAsk } from './orderbook';
 
 const CHAIN_ID = 137;
 
@@ -148,7 +149,7 @@ async function getTokenMeta(client: ClobClient, tokenId: string): Promise<{ tick
   return { tickSize, negRisk };
 }
 
-/** Place an order for a specific profile */
+/** Place an order for a specific profile (maker-enforced) */
 export async function placeProfileOrder(
   profile: ProfileCredentials,
   params: { tokenId: string; side: 'BUY' | 'SELL'; price: number; size: number }
@@ -157,10 +158,32 @@ export async function placeProfileOrder(
   const client = getClientForProfile(profile);
   const { tickSize, negRisk } = await getTokenMeta(client, params.tokenId);
 
+  // Maker enforcement: ensure price doesn't cross the spread
+  const tick = parseFloat(tickSize);
+  let adjustedPrice = params.price;
+
+  const book = await fetchBestBidAsk(params.tokenId);
+  if (book) {
+    if (params.side === 'BUY' && book.bestAsk !== null && params.price >= book.bestAsk) {
+      adjustedPrice = book.bestAsk - tick;
+      console.log(`[maker] BUY price adjusted: ${params.price} → ${adjustedPrice} (bestAsk: ${book.bestAsk})`);
+    }
+    if (params.side === 'SELL' && book.bestBid !== null && params.price <= book.bestBid) {
+      adjustedPrice = book.bestBid + tick;
+      console.log(`[maker] SELL price adjusted: ${params.price} → ${adjustedPrice} (bestBid: ${book.bestBid})`);
+    }
+  }
+
+  // Round to tick size
+  adjustedPrice = Math.round(adjustedPrice / tick) * tick;
+  // Fix floating point: keep same decimal places as tick
+  const decimals = tickSize.split('.')[1]?.length ?? 2;
+  adjustedPrice = parseFloat(adjustedPrice.toFixed(decimals));
+
   return client.createAndPostOrder(
     {
       tokenID: params.tokenId,
-      price: params.price,
+      price: adjustedPrice,
       size: params.size,
       side: params.side as any,
     },

@@ -4,12 +4,12 @@ import { prisma } from '@/lib/db/prisma';
 import { getEnv } from '@/lib/config/env';
 import {
   getClientForProfile,
-  getProfileBalance,
   loadProfile,
   placeProfileOrder,
   type ProfileCredentials,
 } from '@/lib/bot/profile-client';
 import { trackClobCall, trackClobAuthCall } from '@/lib/bot/api-tracker';
+import { fetchBestBidAsk } from '@/lib/bot/orderbook';
 import type { EarlyExitCandidate, EarlyExitResult } from './types';
 
 // ─── Config ─────────────────────────────────────────────
@@ -127,40 +127,14 @@ export async function getNetPositions(profile: ProfileCredentials): Promise<Map<
   return result;
 }
 
-interface BookLevel { price: string; size: string }
-
-/** Fetch orderbook and return best bid with depth, properly sorted */
+/** Fetch best bid for a token using shared orderbook helper */
 async function fetchBestBid(tokenId: string): Promise<{
   bestBid: number;
   bidDepth: number;
 } | null> {
-  try {
-    const clobUrl = getEnv().CLOB_API_URL;
-    trackClobCall();
-    const res = await fetch(`${clobUrl}/book?token_id=${tokenId}`, { cache: 'no-store' });
-    if (!res.ok) return null;
-
-    const book: { bids: BookLevel[]; asks: BookLevel[] } = await res.json();
-    if (!book.bids || book.bids.length === 0) return null;
-
-    // Sort bids descending by price to find true best bid
-    const sortedBids = book.bids
-      .map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) }))
-      .sort((a, b) => b.price - a.price);
-
-    const bestBid = sortedBids[0].price;
-
-    // Sum depth within 1 cent of best bid
-    let bidDepth = 0;
-    for (const level of sortedBids) {
-      if (level.price < bestBid - 0.01) break;
-      bidDepth += level.price * level.size;
-    }
-
-    return { bestBid, bidDepth };
-  } catch {
-    return null;
-  }
+  const book = await fetchBestBidAsk(tokenId);
+  if (!book || book.bestBid === null) return null;
+  return { bestBid: book.bestBid, bidDepth: book.bidDepth };
 }
 
 /** Try to get market question from CLOB API */

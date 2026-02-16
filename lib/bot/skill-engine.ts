@@ -12,6 +12,7 @@ import { getPositions } from '@/lib/skills/position-monitor';
 import { getRiskAssessment } from '@/lib/skills/risk-manager';
 import { executeOrder, executeArbOrder } from '@/lib/skills/order-manager';
 import { executeEarlyExits } from '@/lib/skills/early-exit';
+import { executeRedeem } from '@/lib/skills/redeem';
 import {
   createSession,
   endSession,
@@ -37,6 +38,7 @@ interface BotInstance {
   state: BotState;
   scheduledTimeout: ReturnType<typeof setTimeout> | null;
   logBuffer: BotLogEntry[];
+  redeemRunning: boolean;
 }
 
 // Use globalThis to survive Next.js HMR — prevents zombie engine loops
@@ -237,6 +239,33 @@ async function runCycle(instance: BotInstance) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await log(instance, 'warn', 'early-exit', `Early exit scan failed: ${msg}`);
+    }
+
+    // ── Phase 1.7: Redeem (every 20 cycles ≈ 5min, fire-and-forget) ──
+    // Playwright browser spawn takes 30s~2min — must NOT block the cycle.
+    if (cycleNum % 20 === 0 && !instance.redeemRunning) {
+      instance.redeemRunning = true;
+      await log(instance, 'info', 'redeem', 'Spawning redeem process in background...');
+      executeRedeem(instance.profileId, instance.profileName)
+        .then(async (redeemResult) => {
+          if (redeemResult.claimed > 0) {
+            await log(instance, 'trade', 'redeem', `Redeemed ${redeemResult.claimed} resolved positions`, {
+              claimed: redeemResult.claimed,
+              failed: redeemResult.failed,
+            });
+          } else if (redeemResult.success) {
+            await log(instance, 'info', 'redeem', 'No claimable positions');
+          } else {
+            await log(instance, 'warn', 'redeem', `Redeem failed: ${redeemResult.message}`);
+          }
+        })
+        .catch(async (err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          await log(instance, 'warn', 'redeem', `Redeem error: ${msg}`);
+        })
+        .finally(() => {
+          instance.redeemRunning = false;
+        });
     }
 
     // ── Phase 2: Multi-Strategy Scan + Evaluate (parallel) ──
@@ -528,6 +557,7 @@ export async function startBot(profileId: string): Promise<BotState> {
     },
     scheduledTimeout: null,
     logBuffer: existing?.logBuffer ?? [],
+    redeemRunning: false,
   };
 
   instances.set(profileId, instance);

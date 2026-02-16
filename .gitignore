@@ -38,6 +38,9 @@ next-env.d.ts
 *.db
 *.db-journal
 
+# playwright browser sessions
+playwright-profiles/
+
 # environment
 .env
 .env.local

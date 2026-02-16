@@ -11,7 +11,9 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
     "bot:scan": "npx tsx scripts/market-scanner.ts",
-    "bot:setup-keys": "npx tsx scripts/setup-api-keys.ts"
+    "bot:setup-keys": "npx tsx scripts/setup-api-keys.ts",
+    "redeem": "npx tsx scripts/redeem.ts",
+    "redeem:login": "npx tsx scripts/redeem.ts --login"
   },
   "dependencies": {
     "@heroui/react": "^2.8.8",
@@ -23,6 +25,7 @@
     "ethers": "^5.7.2",
     "framer-motion": "^11.0.0",
     "next": "^15.1.12",
+    "playwright": "^1.58.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.7.0",
