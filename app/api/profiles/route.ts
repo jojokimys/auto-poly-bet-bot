@@ -10,7 +10,10 @@ const createProfileSchema = z.object({
   apiKey: z.string().min(1, 'API key is required'),
   apiSecret: z.string().min(1, 'API secret is required'),
   apiPassphrase: z.string().min(1, 'API passphrase is required'),
-  strategy: z.string().optional().default('value-betting'),
+  builderApiKey: z.string().optional().default(''),
+  builderApiSecret: z.string().optional().default(''),
+  builderApiPassphrase: z.string().optional().default(''),
+  enabledStrategies: z.array(z.string()).optional().default(['value-betting']),
 });
 
 interface ProfilePublicResponse {
@@ -19,8 +22,9 @@ interface ProfilePublicResponse {
   funderAddress: string;
   hasPrivateKey: boolean;
   hasApiCredentials: boolean;
+  hasBuilderCredentials: boolean;
   isActive: boolean;
-  strategy: string;
+  enabledStrategies: string[];
   createdAt: string;
 }
 
@@ -32,18 +36,28 @@ function toPublic(profile: {
   apiKey: string;
   apiSecret: string;
   apiPassphrase: string;
+  builderApiKey: string;
+  builderApiSecret: string;
+  builderApiPassphrase: string;
   isActive: boolean;
-  strategy: string;
+  enabledStrategies: string;
   createdAt: Date;
 }): ProfilePublicResponse {
+  let strategies: string[];
+  try {
+    strategies = JSON.parse(profile.enabledStrategies);
+  } catch {
+    strategies = ['value-betting'];
+  }
   return {
     id: profile.id,
     name: profile.name,
     funderAddress: profile.funderAddress,
     hasPrivateKey: !!profile.privateKey,
     hasApiCredentials: !!(profile.apiKey && profile.apiSecret && profile.apiPassphrase),
+    hasBuilderCredentials: !!(profile.builderApiKey && profile.builderApiSecret && profile.builderApiPassphrase),
     isActive: profile.isActive,
-    strategy: profile.strategy,
+    enabledStrategies: strategies,
     createdAt: profile.createdAt.toISOString(),
   };
 }
@@ -79,7 +93,10 @@ export async function POST(req: NextRequest) {
     }
 
     const profile = await prisma.botProfile.create({
-      data: parsed.data,
+      data: {
+        ...parsed.data,
+        enabledStrategies: JSON.stringify(parsed.data.enabledStrategies),
+      },
     });
 
     return NextResponse.json(toPublic(profile), { status: 201 });

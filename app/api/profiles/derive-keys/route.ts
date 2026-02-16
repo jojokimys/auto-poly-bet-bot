@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { ClobClient } from '@polymarket/clob-client';
 import { SignatureType } from '@polymarket/order-utils';
 import { Wallet } from '@ethersproject/wallet';
-import { getEnv } from '@/lib/config/env';
+import { getEnv, getBuilderConfig } from '@/lib/config/env';
 import { prisma } from '@/lib/db/prisma';
 import { clearProfileClient } from '@/lib/bot/profile-client';
 
@@ -23,18 +23,28 @@ function toPublic(profile: {
   apiKey: string;
   apiSecret: string;
   apiPassphrase: string;
+  builderApiKey: string;
+  builderApiSecret: string;
+  builderApiPassphrase: string;
   isActive: boolean;
-  strategy: string;
+  enabledStrategies: string;
   createdAt: Date;
 }) {
+  let strategies: string[];
+  try {
+    strategies = JSON.parse(profile.enabledStrategies);
+  } catch {
+    strategies = ['value-betting'];
+  }
   return {
     id: profile.id,
     name: profile.name,
     funderAddress: profile.funderAddress,
     hasPrivateKey: !!profile.privateKey,
     hasApiCredentials: !!(profile.apiKey && profile.apiSecret && profile.apiPassphrase),
+    hasBuilderCredentials: !!(profile.builderApiKey && profile.builderApiSecret && profile.builderApiPassphrase),
     isActive: profile.isActive,
-    strategy: profile.strategy,
+    enabledStrategies: strategies,
     createdAt: profile.createdAt.toISOString(),
   };
 }
@@ -102,6 +112,9 @@ export async function POST(req: NextRequest) {
       undefined,
       sigType,
       funderAddress || undefined,
+      undefined,          // geoBlockToken
+      undefined,          // useServerTime
+      getBuilderConfig(), // builderConfig
     );
 
     const creds = await client.createOrDeriveApiKey();

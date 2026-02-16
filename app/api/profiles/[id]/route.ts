@@ -12,8 +12,11 @@ const updateProfileSchema = z.object({
   apiKey: z.string().min(1).optional(),
   apiSecret: z.string().min(1).optional(),
   apiPassphrase: z.string().min(1).optional(),
+  builderApiKey: z.string().optional(),
+  builderApiSecret: z.string().optional(),
+  builderApiPassphrase: z.string().optional(),
   isActive: z.boolean().optional(),
-  strategy: z.string().optional(),
+  enabledStrategies: z.array(z.string()).optional(),
 });
 
 interface ProfilePublicResponse {
@@ -22,8 +25,9 @@ interface ProfilePublicResponse {
   funderAddress: string;
   hasPrivateKey: boolean;
   hasApiCredentials: boolean;
+  hasBuilderCredentials: boolean;
   isActive: boolean;
-  strategy: string;
+  enabledStrategies: string[];
   createdAt: string;
 }
 
@@ -35,18 +39,28 @@ function toPublic(profile: {
   apiKey: string;
   apiSecret: string;
   apiPassphrase: string;
+  builderApiKey: string;
+  builderApiSecret: string;
+  builderApiPassphrase: string;
   isActive: boolean;
-  strategy: string;
+  enabledStrategies: string;
   createdAt: Date;
 }): ProfilePublicResponse {
+  let strategies: string[];
+  try {
+    strategies = JSON.parse(profile.enabledStrategies);
+  } catch {
+    strategies = ['value-betting'];
+  }
   return {
     id: profile.id,
     name: profile.name,
     funderAddress: profile.funderAddress,
     hasPrivateKey: !!profile.privateKey,
     hasApiCredentials: !!(profile.apiKey && profile.apiSecret && profile.apiPassphrase),
+    hasBuilderCredentials: !!(profile.builderApiKey && profile.builderApiSecret && profile.builderApiPassphrase),
     isActive: profile.isActive,
-    strategy: profile.strategy,
+    enabledStrategies: strategies,
     createdAt: profile.createdAt.toISOString(),
   };
 }
@@ -110,8 +124,11 @@ export async function PUT(
     if (data.apiKey !== undefined) updateData.apiKey = data.apiKey;
     if (data.apiSecret !== undefined) updateData.apiSecret = data.apiSecret;
     if (data.apiPassphrase !== undefined) updateData.apiPassphrase = data.apiPassphrase;
+    if (data.builderApiKey !== undefined) updateData.builderApiKey = data.builderApiKey;
+    if (data.builderApiSecret !== undefined) updateData.builderApiSecret = data.builderApiSecret;
+    if (data.builderApiPassphrase !== undefined) updateData.builderApiPassphrase = data.builderApiPassphrase;
     if (data.isActive !== undefined) updateData.isActive = data.isActive;
-    if (data.strategy !== undefined) updateData.strategy = data.strategy;
+    if (data.enabledStrategies !== undefined) updateData.enabledStrategies = JSON.stringify(data.enabledStrategies);
 
     const profile = await prisma.botProfile.update({
       where: { id },
@@ -119,7 +136,7 @@ export async function PUT(
     });
 
     // If credentials changed, clear the cached client so it gets recreated
-    if (data.privateKey || data.apiKey || data.apiSecret || data.apiPassphrase || data.funderAddress !== undefined || data.signatureType !== undefined) {
+    if (data.privateKey || data.apiKey || data.apiSecret || data.apiPassphrase || data.builderApiKey !== undefined || data.builderApiSecret !== undefined || data.builderApiPassphrase !== undefined || data.funderAddress !== undefined || data.signatureType !== undefined) {
       clearProfileClient(id);
     }
 
