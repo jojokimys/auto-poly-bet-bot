@@ -4,24 +4,16 @@ import { useEffect, useState } from 'react';
 import {
   Card,
   CardBody,
-  CardHeader,
-  Input,
   Button,
-  Checkbox,
-  Divider,
   Spinner,
   useDisclosure,
 } from '@heroui/react';
-import { useSettingsStore } from '@/store/useSettingsStore';
 import { useProfileStore, type ProfilePublic } from '@/store/useProfileStore';
 import { useGlobalBotStore } from '@/store/useGlobalBotStore';
 import { ProfileModal } from '@/components/ProfileModal';
 import { ProfileCard } from '@/components/ProfileCard';
 
 export default function SettingsPage() {
-  const { settings, loading: settingsLoading, saving, error: settingsError, success: settingsSuccess, fetchSettings, saveSettings } =
-    useSettingsStore();
-
   const { profiles, loading: profilesLoading, error: profilesError, success: profilesSuccess, fetchProfiles, clearMessages } =
     useProfileStore();
 
@@ -31,45 +23,9 @@ export default function SettingsPage() {
   const globalPoll = useGlobalBotStore((s) => s.poll);
   const [botActionLoading, setBotActionLoading] = useState<string | null>(null);
 
-  const [form, setForm] = useState({
-    maxBetAmount: '10',
-    minLiquidity: '1000',
-    minVolume: '5000',
-    maxSpread: '0.05',
-    autoBettingEnabled: false,
-    scanIntervalSeconds: '30',
-  });
-
   useEffect(() => {
-    fetchSettings();
     fetchProfiles();
-  }, [fetchSettings, fetchProfiles]);
-
-  useEffect(() => {
-    if (settings) {
-      setForm({
-        maxBetAmount: String(settings.maxBetAmount),
-        minLiquidity: String(settings.minLiquidity),
-        minVolume: String(settings.minVolume),
-        maxSpread: String(settings.maxSpread),
-        autoBettingEnabled: settings.autoBettingEnabled,
-        scanIntervalSeconds: String(settings.scanIntervalSeconds),
-      });
-    }
-  }, [settings]);
-
-  // Bot states come from global store (polled by HeaderBotStatus)
-
-  const handleSaveSettings = async () => {
-    const data: Record<string, unknown> = {};
-    data.maxBetAmount = parseFloat(form.maxBetAmount) || 10;
-    data.minLiquidity = parseFloat(form.minLiquidity) || 1000;
-    data.minVolume = parseFloat(form.minVolume) || 5000;
-    data.maxSpread = parseFloat(form.maxSpread) || 0.05;
-    data.autoBettingEnabled = form.autoBettingEnabled;
-    data.scanIntervalSeconds = parseInt(form.scanIntervalSeconds) || 30;
-    await saveSettings(data);
-  };
+  }, [fetchProfiles]);
 
   const handleAddProfile = () => {
     setEditingProfile(null);
@@ -112,7 +68,7 @@ export default function SettingsPage() {
     setBotActionLoading(null);
   };
 
-  if (settingsLoading && profilesLoading) {
+  if (profilesLoading) {
     return (
       <div className="flex justify-center py-12">
         <Spinner size="lg" />
@@ -210,73 +166,6 @@ export default function SettingsPage() {
           </div>
         )}
       </div>
-
-      <Divider />
-
-      {/* ===== Global Bot Parameters Section ===== */}
-      <Card>
-        <CardHeader>
-          <div>
-            <h3 className="text-lg font-semibold">Global Bot Parameters</h3>
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              Default parameters applied to all bot profiles
-            </p>
-          </div>
-        </CardHeader>
-        <CardBody className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Input
-              type="number"
-              label="Max Bet Amount (USDC)"
-              variant="bordered"
-              value={form.maxBetAmount}
-              onValueChange={(v) => setForm((f) => ({ ...f, maxBetAmount: v }))}
-            />
-            <Input
-              type="number"
-              label="Min Liquidity"
-              variant="bordered"
-              value={form.minLiquidity}
-              onValueChange={(v) => setForm((f) => ({ ...f, minLiquidity: v }))}
-            />
-            <Input
-              type="number"
-              label="Min Volume"
-              variant="bordered"
-              value={form.minVolume}
-              onValueChange={(v) => setForm((f) => ({ ...f, minVolume: v }))}
-            />
-            <Input
-              type="number"
-              label="Max Spread"
-              variant="bordered"
-              value={form.maxSpread}
-              onValueChange={(v) => setForm((f) => ({ ...f, maxSpread: v }))}
-              description="Between 0 and 1"
-            />
-            <Input
-              type="number"
-              label="Scan Interval (seconds)"
-              variant="bordered"
-              value={form.scanIntervalSeconds}
-              onValueChange={(v) => setForm((f) => ({ ...f, scanIntervalSeconds: v }))}
-            />
-          </div>
-          <Checkbox
-            isSelected={form.autoBettingEnabled}
-            onValueChange={(v) => setForm((f) => ({ ...f, autoBettingEnabled: v }))}
-          >
-            Enable automatic betting
-          </Checkbox>
-        </CardBody>
-      </Card>
-
-      {settingsError && <p className="text-sm text-danger">{settingsError}</p>}
-      {settingsSuccess && <p className="text-sm text-success">{settingsSuccess}</p>}
-
-      <Button color="primary" className="w-full" onPress={handleSaveSettings} isLoading={saving}>
-        Save Global Settings
-      </Button>
 
       {/* Profile Modal */}
       <ProfileModal
