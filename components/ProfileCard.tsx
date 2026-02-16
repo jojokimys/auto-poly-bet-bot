@@ -128,6 +128,9 @@ export function ProfileCard({
             <Chip size="sm" variant="flat" color={profile.hasApiCredentials ? 'success' : 'warning'}>
               {profile.hasApiCredentials ? 'API keys set' : 'API keys not set'}
             </Chip>
+            <Chip size="sm" variant="flat" color={profile.hasBuilderCredentials ? 'success' : 'warning'}>
+              {profile.hasBuilderCredentials ? 'Builder keys set' : 'Builder keys not set'}
+            </Chip>
           </div>
 
           {/* Key setup prompt */}

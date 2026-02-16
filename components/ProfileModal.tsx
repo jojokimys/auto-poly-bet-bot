@@ -45,6 +45,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
     apiKey: '',
     apiSecret: '',
     apiPassphrase: '',
+    builderApiKey: '',
+    builderApiSecret: '',
+    builderApiPassphrase: '',
     strategy: 'value-betting',
   });
 
@@ -66,6 +69,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
           apiKey: '',
           apiSecret: '',
           apiPassphrase: '',
+          builderApiKey: '',
+          builderApiSecret: '',
+          builderApiPassphrase: '',
           strategy: profile.strategy || 'value-betting',
         });
       } else {
@@ -76,6 +82,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
           apiKey: '',
           apiSecret: '',
           apiPassphrase: '',
+          builderApiKey: '',
+          builderApiSecret: '',
+          builderApiPassphrase: '',
           strategy: 'value-betting',
         });
       }
@@ -183,6 +192,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
       if (form.apiKey) data.apiKey = form.apiKey;
       if (form.apiSecret) data.apiSecret = form.apiSecret;
       if (form.apiPassphrase) data.apiPassphrase = form.apiPassphrase;
+      if (form.builderApiKey) data.builderApiKey = form.builderApiKey;
+      if (form.builderApiSecret) data.builderApiSecret = form.builderApiSecret;
+      if (form.builderApiPassphrase) data.builderApiPassphrase = form.builderApiPassphrase;
       data.strategy = form.strategy;
       ok = await updateProfile(profile.id, data);
     } else {
@@ -195,6 +207,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
         strategy: form.strategy,
       };
       if (form.funderAddress) data.funderAddress = form.funderAddress;
+      if (form.builderApiKey) data.builderApiKey = form.builderApiKey;
+      if (form.builderApiSecret) data.builderApiSecret = form.builderApiSecret;
+      if (form.builderApiPassphrase) data.builderApiPassphrase = form.builderApiPassphrase;
       ok = await createProfile(data);
     }
 
@@ -312,6 +327,57 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
               variant="bordered"
               value={form.apiPassphrase}
               onValueChange={(v) => setForm((f) => ({ ...f, apiPassphrase: v }))}
+            />
+          </div>
+
+          {/* Builder API Credentials Section */}
+          <div className="space-y-3">
+            <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Builder API Credentials
+              {isEditMode && profile?.hasBuilderCredentials && (
+                <span className="ml-2 text-xs text-success">Configured</span>
+              )}
+            </p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              From{' '}
+              <a
+                href="https://polymarket.com/settings?tab=builder"
+                target="_blank"
+                rel="noreferrer"
+                className="text-primary underline"
+              >
+                builders.polymarket.com
+              </a>
+              {' '}— required for order placement
+            </p>
+            <Input
+              label="Builder API Key"
+              placeholder={
+                isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder API key'
+              }
+              variant="bordered"
+              value={form.builderApiKey}
+              onValueChange={(v) => setForm((f) => ({ ...f, builderApiKey: v }))}
+            />
+            <Input
+              type="password"
+              label="Builder API Secret"
+              placeholder={
+                isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder secret'
+              }
+              variant="bordered"
+              value={form.builderApiSecret}
+              onValueChange={(v) => setForm((f) => ({ ...f, builderApiSecret: v }))}
+            />
+            <Input
+              type="password"
+              label="Builder API Passphrase"
+              placeholder={
+                isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder passphrase'
+              }
+              variant="bordered"
+              value={form.builderApiPassphrase}
+              onValueChange={(v) => setForm((f) => ({ ...f, builderApiPassphrase: v }))}
             />
           </div>
 

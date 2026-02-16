@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from 'react';
 import { Card, CardBody, CardHeader, Chip, Divider, Spinner } from '@heroui/react';
-import { OrderForm } from './OrderForm';
 import type { Market } from '@/lib/types/app';
 import type { OrderBookSummary } from '@/lib/types/polymarket';
 
@@ -108,12 +107,6 @@ export function MarketDetail({ market }: MarketDetailProps) {
             </div>
           )}
 
-          <Divider />
-
-          <div>
-            <p className="text-sm font-semibold mb-3">Place Order</p>
-            <OrderForm market={market} />
-          </div>
         </CardBody>
       </Card>
     </div>
