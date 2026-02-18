@@ -320,7 +320,7 @@ export async function scanPanicReversalMarkets(
 }
 
 // Crypto keyword patterns for market question matching
-const CRYPTO_KEYWORDS = /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto)\b/i;
+export const CRYPTO_KEYWORDS = /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto)\b/i;
 
 /**
  * Scan for crypto latency arb opportunities.
@@ -531,14 +531,14 @@ export async function scanMultiOutcomeArbMarkets(
 // ─── Crypto Scalper Scanner ──────────────────────────────
 
 /** Maps question keywords to Binance symbols */
-const CRYPTO_ASSET_MAP: { pattern: RegExp; symbol: CryptoSymbol; asset: string }[] = [
+export const CRYPTO_ASSET_MAP: { pattern: RegExp; symbol: CryptoSymbol; asset: string }[] = [
   { pattern: /\b(btc|bitcoin)\b/i, symbol: 'BTCUSDT', asset: 'BTC' },
   { pattern: /\b(eth|ethereum)\b/i, symbol: 'ETHUSDT', asset: 'ETH' },
   { pattern: /\b(sol|solana)\b/i, symbol: 'SOLUSDT', asset: 'SOL' },
   { pattern: /\bxrp\b/i, symbol: 'XRPUSDT', asset: 'XRP' },
 ];
 
-function detectCryptoAsset(question: string): { symbol: CryptoSymbol; asset: string } | null {
+export function detectCryptoAsset(question: string): { symbol: CryptoSymbol; asset: string } | null {
   for (const entry of CRYPTO_ASSET_MAP) {
     if (entry.pattern.test(question)) {
       return { symbol: entry.symbol, asset: entry.asset };
@@ -556,11 +556,52 @@ function extractStrikePrice(question: string): number | null {
 }
 
 /**
+ * Parse start time from crypto market questions with explicit time ranges.
+ * e.g. "Bitcoin Up or Down - February 17, 3:45AM-3:50AM ET" → 3:45AM ET on Feb 17
+ * Returns null if no time range found.
+ */
+export function parseCryptoMarketStartTime(question: string): Date | null {
+  const match = question.match(
+    /(\w+)\s+(\d{1,2}),?\s+(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–]\s*\d{1,2}:\d{2}\s*(?:AM|PM)\s*(ET|EST|EDT|CT|PT|UTC)/i,
+  );
+  if (!match) return null;
+
+  const [, monthStr, dayStr, startHourStr, startMinStr, ampm, tz] = match;
+
+  const monthMap: Record<string, number> = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11,
+  };
+  const month = monthMap[monthStr.toLowerCase()];
+  if (month === undefined) return null;
+
+  let hour = parseInt(startHourStr);
+  if (ampm.toUpperCase() === 'PM' && hour !== 12) hour += 12;
+  if (ampm.toUpperCase() === 'AM' && hour === 12) hour = 0;
+
+  const tzOffsets: Record<string, number> = {
+    ET: 5, EST: 5, EDT: 4, CT: 6, PT: 8, UTC: 0,
+  };
+  const offset = tzOffsets[tz.toUpperCase()] ?? 5;
+
+  const year = new Date().getFullYear();
+  const date = new Date(
+    Date.UTC(year, month, parseInt(dayStr), hour + offset, parseInt(startMinStr)),
+  );
+
+  if (date.getTime() < Date.now() - 24 * 60 * 60 * 1000) {
+    date.setFullYear(year + 1);
+  }
+
+  return date;
+}
+
+/**
  * Parse actual end time from crypto market questions with explicit time ranges.
  * e.g. "Bitcoin Up or Down - February 17, 3:45AM-3:50AM ET" → 3:50AM ET on Feb 17
  * Returns null if no time range found (e.g. daily "Up or Down on February 16?" markets).
  */
-function parseCryptoMarketEndTime(question: string): Date | null {
+export function parseCryptoMarketEndTime(question: string): Date | null {
   // Match: "Month Day, startTime-endTime timezone"
   const match = question.match(
     /(\w+)\s+(\d{1,2}),?\s+\d{1,2}:\d{2}\s*(?:AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)\s*(ET|EST|EDT|CT|PT|UTC)/i,

@@ -39,6 +39,35 @@ const CRYPTO_CACHE_TTL_MS = 1000;
 const SUPPORTED_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'] as const;
 export type CryptoSymbol = (typeof SUPPORTED_SYMBOLS)[number];
 
+// ─── Historical Price (opening price of crypto markets) ──
+
+const historicalPriceCache = new Map<string, number>();
+
+export async function getHistoricalPrice(
+  symbol: CryptoSymbol,
+  timestampMs: number,
+): Promise<number | null> {
+  const cacheKey = `${symbol}:${timestampMs}`;
+  const cached = historicalPriceCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  if (timestampMs > Date.now()) return null;
+
+  const res = await fetch(
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&startTime=${timestampMs}&limit=1`,
+    { cache: 'no-store' },
+  );
+
+  if (!res.ok) return null;
+
+  const raw: any[][] = await res.json();
+  if (raw.length === 0) return null;
+
+  const openPrice = parseFloat(raw[0][1]);
+  historicalPriceCache.set(cacheKey, openPrice);
+  return openPrice;
+}
+
 export async function getCryptoPrice(symbol: CryptoSymbol): Promise<number> {
   const now = Date.now();
   const cached = cryptoCache.get(symbol);

@@ -11,6 +11,76 @@ import { fetchBestBidAsk } from './orderbook';
 
 const CHAIN_ID = 137;
 
+// ─── Retry wrapper for transient CLOB errors ────────────
+
+const TRANSIENT_RE = /EADDRNOTAVAIL|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN|socket hang up|network|fetch failed|AggregateError/i;
+
+function isTransientError(err: unknown): boolean {
+  if (err instanceof AggregateError) return true;
+  if (err instanceof Error) return TRANSIENT_RE.test(err.message);
+  if (typeof err === 'string') return TRANSIENT_RE.test(err);
+  return false;
+}
+
+function isErrorResponse(result: unknown): result is { error: unknown } {
+  return result !== null && typeof result === 'object' && 'error' in (result as any);
+}
+
+function isTransientErrorResponse(result: { error: unknown }): boolean {
+  const e = result.error;
+  if (e instanceof AggregateError) return true;
+  if (e instanceof Error) return TRANSIENT_RE.test(e.message);
+  if (typeof e === 'string') return TRANSIENT_RE.test(e);
+  return false;
+}
+
+function cleanErrorMessage(err: unknown): string {
+  if (err instanceof AggregateError) {
+    const inner = err.errors?.map((e: Error) => e.message).join('; ') ?? '';
+    return `AggregateError: ${err.message} [${inner}]`;
+  }
+  if (err instanceof Error) {
+    return err.message.replace(/\{[\s\S]*"POLY_API_KEY"[\s\S]*\}/, '[config redacted]');
+  }
+  return String(err);
+}
+
+/**
+ * Retry wrapper for CLOB client calls.
+ * Handles BOTH thrown errors AND error-return pattern ({ error: ... })
+ * used by @polymarket/clob-client's internal errorHandling.
+ */
+async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 500): Promise<T> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const result = await fn();
+
+      // CLOB client swallows errors and returns { error: ... } instead of throwing
+      if (isErrorResponse(result)) {
+        if (attempt < retries && isTransientErrorResponse(result)) {
+          console.warn(`[clob-retry] Transient error (attempt ${attempt + 1}/${retries + 1}): ${cleanErrorMessage(result.error)}`);
+          await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+          continue;
+        }
+        throw new Error(cleanErrorMessage(result.error));
+      }
+
+      return result;
+    } catch (err) {
+      if (attempt < retries && isTransientError(err)) {
+        console.warn(`[clob-retry] Transient error (attempt ${attempt + 1}/${retries + 1}): ${cleanErrorMessage(err)}`);
+        await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
+        continue;
+      }
+      const clean = cleanErrorMessage(err);
+      const wrapped = new Error(clean);
+      wrapped.cause = err;
+      throw wrapped;
+    }
+  }
+  throw new Error('withRetry: unreachable');
+}
+
 export interface ProfileCredentials {
   id: string;
   name: string;
@@ -106,9 +176,9 @@ export function clearAllProfileClients() {
 export async function getProfileBalance(profile: ProfileCredentials): Promise<number> {
   trackClobAuthCall();
   const client = getClientForProfile(profile);
-  const result = await client.getBalanceAllowance({
+  const result = await withRetry(() => client.getBalanceAllowance({
     asset_type: 'COLLATERAL' as any,
-  });
+  }));
   return parseFloat(result.balance) / 1e6;
 }
 
@@ -116,14 +186,14 @@ export async function getProfileBalance(profile: ProfileCredentials): Promise<nu
 export async function getProfileTrades(profile: ProfileCredentials) {
   trackClobAuthCall();
   const client = getClientForProfile(profile);
-  return client.getTrades();
+  return withRetry(() => client.getTrades());
 }
 
 /** Get open orders for a specific profile */
 export async function getProfileOpenOrders(profile: ProfileCredentials) {
   trackClobAuthCall();
   const client = getClientForProfile(profile);
-  const orders = await client.getOpenOrders();
+  const orders = await withRetry(() => client.getOpenOrders());
   return orders as any[];
 }
 
@@ -140,10 +210,10 @@ async function getTokenMeta(client: ClobClient, tokenId: string): Promise<{ tick
 
   trackClobAuthCall(); // getTickSize
   trackClobAuthCall(); // getNegRisk
-  const [tickSize, negRisk] = await Promise.all([
+  const [tickSize, negRisk] = await withRetry(() => Promise.all([
     client.getTickSize(tokenId),
     client.getNegRisk(tokenId),
-  ]);
+  ]));
 
   tokenMetaCache.set(tokenId, { tickSize, negRisk, expiresAt: Date.now() + TOKEN_META_TTL_MS });
   return { tickSize, negRisk };
@@ -180,7 +250,7 @@ export async function placeProfileOrder(
   const decimals = tickSize.split('.')[1]?.length ?? 2;
   adjustedPrice = parseFloat(adjustedPrice.toFixed(decimals));
 
-  return client.createAndPostOrder(
+  return withRetry(() => client.createAndPostOrder(
     {
       tokenID: params.tokenId,
       price: adjustedPrice,
@@ -188,19 +258,19 @@ export async function placeProfileOrder(
       side: params.side as any,
     },
     { tickSize, negRisk },
-  );
+  ));
 }
 
 /** Cancel all open orders for a profile */
 export async function cancelAllProfileOrders(profile: ProfileCredentials) {
   trackClobAuthCall();
   const client = getClientForProfile(profile);
-  return client.cancelAll();
+  return withRetry(() => client.cancelAll());
 }
 
 /** Cancel specific orders by hash */
 export async function cancelProfileOrders(profile: ProfileCredentials, orderIds: string[]) {
   trackClobAuthCall();
   const client = getClientForProfile(profile);
-  return client.cancelOrders(orderIds);
+  return withRetry(() => client.cancelOrders(orderIds));
 }

@@ -118,17 +118,42 @@ export function computeStats(
   const grossLoss = Math.abs(losses.reduce((sum, t) => sum + t.realizedPnl!, 0));
   const totalFees = trades.reduce((sum, t) => sum + t.fee, 0);
 
-  // Count open positions: assets with unmatched buys
+  // Count open positions and compute position value using FIFO entry prices
   const netByAsset = new Map<string, number>();
+  const buyQueues = new Map<string, { price: number; size: number }[]>();
   for (const t of trades) {
     const key = `${t.profileId ?? '_'}::${t.asset_id}`;
     const current = netByAsset.get(key) ?? 0;
-    netByAsset.set(
-      key,
-      t.side === 'BUY' ? current + t.size : current - t.size
-    );
+    if (t.side === 'BUY') {
+      netByAsset.set(key, current + t.size);
+      const queue = buyQueues.get(key) ?? [];
+      queue.push({ price: t.price, size: t.size });
+      buyQueues.set(key, queue);
+    } else {
+      netByAsset.set(key, current - t.size);
+      // Consume from buy queue (FIFO)
+      let remaining = t.size;
+      const queue = buyQueues.get(key) ?? [];
+      while (remaining > 0 && queue.length > 0) {
+        const buy = queue[0];
+        const matched = Math.min(remaining, buy.size);
+        buy.size -= matched;
+        remaining -= matched;
+        if (buy.size <= 0.0001) queue.shift();
+      }
+    }
   }
   const openPositions = [...netByAsset.values()].filter((v) => v > 0.001).length;
+
+  // Position value = sum of remaining buy queue entries (size × entry price)
+  let positionValue = 0;
+  for (const queue of buyQueues.values()) {
+    for (const entry of queue) {
+      if (entry.size > 0.0001) {
+        positionValue += entry.size * entry.price;
+      }
+    }
+  }
 
   const pnlValues = sells.map((t) => t.realizedPnl!);
 
@@ -147,6 +172,7 @@ export function computeStats(
     totalFees,
     openPositions,
     currentBalance,
+    positionValue,
   };
 }
 
@@ -303,6 +329,7 @@ async function getDashboardDataForProfile(
         totalFees: 0,
         openPositions: 0,
         currentBalance: 0,
+        positionValue: 0,
       },
       balanceHistory: [],
       pnlHistory: [],
@@ -343,6 +370,7 @@ async function getDashboardDataForAllProfiles(): Promise<DashboardData> {
         totalFees: 0,
         openPositions: 0,
         currentBalance: 0,
+        positionValue: 0,
       },
       balanceHistory: [],
       pnlHistory: [],

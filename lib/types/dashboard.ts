@@ -29,6 +29,7 @@ export interface DashboardStats {
   totalFees: number;
   openPositions: number;
   currentBalance: number;
+  positionValue: number;
 }
 
 export interface BalanceDataPoint {

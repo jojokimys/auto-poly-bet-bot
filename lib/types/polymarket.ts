@@ -70,6 +70,7 @@ export interface GammaMarket {
   icon?: string;
   volume24hr?: string;
   spread?: string;
+  negRisk?: boolean;
 }
 
 export interface OrderBookSummary {

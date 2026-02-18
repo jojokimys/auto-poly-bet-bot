@@ -12,7 +12,11 @@ import { getPositions } from '@/lib/skills/position-monitor';
 import { getRiskAssessment } from '@/lib/skills/risk-manager';
 import { executeOrder, executeArbOrder } from '@/lib/skills/order-manager';
 import { executeEarlyExits } from '@/lib/skills/early-exit';
-import { executeRedeem } from '@/lib/skills/redeem';
+import {
+  isConditionResolved,
+  redeemPositions as redeemOnChain,
+} from '@/lib/polymarket/redeem';
+import { getReadClient } from '@/lib/polymarket/client';
 import {
   createSession,
   endSession,
@@ -197,8 +201,9 @@ async function runCycle(instance: BotInstance) {
     }
 
     // ── Phase 1.5: Early Exit ──
+    let exitResult: Awaited<ReturnType<typeof executeEarlyExits>> | null = null;
     try {
-      const exitResult = await executeEarlyExits(instance.profileId, undefined, profile);
+      exitResult = await executeEarlyExits(instance.profileId, undefined, profile);
       if (exitResult.summary.totalExecuted > 0) {
         await log(instance, 'trade', 'early-exit', `Early exit: sold ${exitResult.summary.totalExecuted} near-confirmed positions, freed ~$${exitResult.summary.capitalFreed.toFixed(2)}`, {
           candidates: exitResult.candidates.map(c => ({
@@ -241,31 +246,67 @@ async function runCycle(instance: BotInstance) {
       await log(instance, 'warn', 'early-exit', `Early exit scan failed: ${msg}`);
     }
 
-    // ── Phase 1.7: Redeem (every 20 cycles ≈ 5min, fire-and-forget) ──
-    // Playwright browser spawn takes 30s~2min — must NOT block the cycle.
-    if (cycleNum % 20 === 0 && !instance.redeemRunning) {
+    // ── Phase 1.7: On-chain Redeem (for resolved positions) ──
+    // Early-exit (Phase 1.5) already sells at bestBid >= 99.5¢ via CLOB.
+    // This phase claims resolved positions via CTF/NegRisk contract.
+    const redeemCandidates = exitResult?.candidates.filter(c => c.currentBestBid >= 0.995) ?? [];
+    if (redeemCandidates.length > 0 && !instance.redeemRunning) {
       instance.redeemRunning = true;
-      await log(instance, 'info', 'redeem', 'Spawning redeem process in background...');
-      executeRedeem(instance.profileId, instance.profileName)
-        .then(async (redeemResult) => {
-          if (redeemResult.claimed > 0) {
-            await log(instance, 'trade', 'redeem', `Redeemed ${redeemResult.claimed} resolved positions`, {
-              claimed: redeemResult.claimed,
-              failed: redeemResult.failed,
-            });
-          } else if (redeemResult.success) {
-            await log(instance, 'info', 'redeem', 'No claimable positions');
-          } else {
-            await log(instance, 'warn', 'redeem', `Redeem failed: ${redeemResult.message}`);
+      (async () => {
+        let redeemed = 0;
+        const clobUrl = (await import('@/lib/config/env')).getEnv().CLOB_API_URL;
+        const readClient = getReadClient();
+
+        // Deduplicate by conditionId (one redeem per condition)
+        const seen = new Set<string>();
+        for (const c of redeemCandidates) {
+          if (seen.has(c.conditionId)) continue;
+          seen.add(c.conditionId);
+
+          try {
+            const resolved = await isConditionResolved(c.conditionId);
+            if (!resolved) continue;
+
+            // Fetch market to get both YES/NO tokenIds
+            const negRisk = await readClient.getNegRisk(c.tokenId).catch(() => true);
+            let yesTokenId = c.tokenId;
+            let noTokenId = c.tokenId;
+            try {
+              const res = await fetch(`${clobUrl}/markets/${c.conditionId}`, { cache: 'no-store' });
+              const mkt = await res.json();
+              if (mkt.tokens?.length >= 2) {
+                yesTokenId = mkt.tokens[0].token_id;
+                noTokenId = mkt.tokens[1].token_id;
+              }
+            } catch { /* fallback: both set to c.tokenId — standard CTF still works with indexSets */ }
+
+            const result = await redeemOnChain(
+              profile!.privateKey,
+              c.conditionId,
+              negRisk,
+              yesTokenId,
+              noTokenId,
+            );
+            if (result.success && result.txHash) {
+              redeemed++;
+              await log(instance, 'trade', 'redeem', `Redeemed resolved: ${c.outcome} (tx: ${result.txHash.slice(0, 10)}...)`, {
+                conditionId: c.conditionId,
+                txHash: result.txHash,
+              });
+            } else if (result.error) {
+              await log(instance, 'warn', 'redeem', `Redeem failed for ${c.outcome}: ${result.error}`);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await log(instance, 'warn', 'redeem', `Redeem error: ${msg}`);
           }
-        })
-        .catch(async (err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          await log(instance, 'warn', 'redeem', `Redeem error: ${msg}`);
-        })
-        .finally(() => {
-          instance.redeemRunning = false;
-        });
+        }
+        if (redeemed > 0) {
+          await log(instance, 'trade', 'redeem', `On-chain redeemed ${redeemed} resolved position(s)`);
+        }
+      })()
+        .catch(() => {})
+        .finally(() => { instance.redeemRunning = false; });
     }
 
     // ── Phase 2: Multi-Strategy Scan + Evaluate (parallel) ──
