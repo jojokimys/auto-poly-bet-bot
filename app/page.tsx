@@ -66,7 +66,7 @@ export default function Home() {
         >
           {[
             <SelectItem key="all">All Profiles</SelectItem>,
-            ...profiles.map((p) => (
+            ...profiles.filter((p) => p.isActive).map((p) => (
               <SelectItem key={p.id}>{p.name}</SelectItem>
             )),
           ]}
