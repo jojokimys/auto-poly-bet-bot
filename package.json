@@ -24,6 +24,7 @@
     "dotenv": "^17.2.4",
     "ethers": "^5.7.2",
     "framer-motion": "^11.0.0",
+    "lightweight-charts": "^5.1.0",
     "next": "^15.1.12",
     "playwright": "^1.58.2",
     "react": "^19.0.0",
@@ -31,6 +32,7 @@
     "recharts": "^3.7.0",
     "server-only": "^0.0.1",
     "sonner": "^2.0.7",
+    "ws": "^8.19.0",
     "zod": "^3.24.1",
     "zustand": "^4.5.0"
   },
@@ -38,6 +40,7 @@
     "@types/node": "^20.11.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.18.1",
     "autoprefixer": "^10.4.17",
     "eslint": "^8.56.0",
     "eslint-config-next": "^15.1.12",

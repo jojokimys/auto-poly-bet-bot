@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  serverExternalPackages: ['@polymarket/clob-client', 'ethers'],
+  serverExternalPackages: ['@polymarket/clob-client', 'ethers', 'ws', 'bufferutil', 'utf-8-validate'],
   experimental: {
     instrumentationHook: true,
   },
