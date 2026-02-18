@@ -48,18 +48,19 @@ function renderCells(trade: DashboardTrade, showProfile?: boolean) {
     );
   }
 
+  const isYes = trade.outcome === 'Yes';
   cells.push(
-    <TableCell key="side">
-      <Chip
-        size="sm"
-        variant="flat"
-        color={trade.side === 'BUY' ? 'primary' : 'warning'}
-      >
-        {trade.side}
-      </Chip>
-    </TableCell>,
-    <TableCell key="outcome" className="max-w-[120px] truncate">
-      {trade.outcome}
+    <TableCell key="outcome">
+      <div className="flex items-center gap-1">
+        <Chip
+          size="sm"
+          variant="flat"
+          color={isYes ? 'success' : 'danger'}
+        >
+          {trade.outcome}
+        </Chip>
+        <span className="text-[10px] text-gray-400">{trade.side === 'BUY' ? 'Buy' : 'Sell'}</span>
+      </div>
     </TableCell>,
     <TableCell key="price">${trade.price.toFixed(2)}</TableCell>,
     <TableCell key="size">{trade.size.toFixed(2)}</TableCell>,
@@ -104,7 +105,6 @@ export function TradeHistoryTable({ trades, loading, showProfile }: TradeHistory
     const cols = [
       { key: 'date', label: 'Date' },
       ...(showProfile ? [{ key: 'profile', label: 'Profile' }] : []),
-      { key: 'side', label: 'Side' },
       { key: 'outcome', label: 'Outcome' },
       { key: 'price', label: 'Price' },
       { key: 'size', label: 'Size' },

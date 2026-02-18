@@ -42,8 +42,8 @@ function fmtPct(n: number): string {
 export function StatsCards({ stats, loading }: StatsCardsProps) {
   if (loading || !stats) {
     return (
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        {Array.from({ length: 8 }).map((_, i) => (
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+        {Array.from({ length: 9 }).map((_, i) => (
           <Card key={i}>
             <CardBody className="py-3 px-4">
               <div className="h-4 w-20 bg-gray-200 dark:bg-gray-700 rounded animate-pulse mb-2" />
@@ -55,11 +55,18 @@ export function StatsCards({ stats, loading }: StatsCardsProps) {
     );
   }
 
+  const portfolio = stats.currentBalance + stats.positionValue;
+
   const cards: StatCardProps[] = [
     {
-      label: 'Balance',
-      value: fmtUsd(stats.currentBalance),
+      label: 'Portfolio',
+      value: fmtUsd(portfolio),
       color: 'text-blue-500',
+    },
+    {
+      label: 'Cash',
+      value: fmtUsd(stats.currentBalance),
+      color: 'text-blue-400',
     },
     {
       label: 'Total P&L',
@@ -99,7 +106,7 @@ export function StatsCards({ stats, loading }: StatsCardsProps) {
   ];
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
       {cards.map((card) => (
         <StatCard key={card.label} {...card} />
       ))}
