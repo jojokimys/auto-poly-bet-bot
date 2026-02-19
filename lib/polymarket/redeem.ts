@@ -33,18 +33,26 @@ export interface OnChainRedeemResult {
 
 let providerCache: JsonRpcProvider | null = null;
 
-function getProvider(): JsonRpcProvider {
-  if (!providerCache) {
-    providerCache = new JsonRpcProvider(POLYGON_RPC);
+function getProvider(forceNew = false): JsonRpcProvider {
+  if (!providerCache || forceNew) {
+    // Pass chainId explicitly to skip auto network detection (avoids NETWORK_ERROR)
+    providerCache = new JsonRpcProvider(POLYGON_RPC, 137);
   }
   return providerCache;
 }
 
 /** Check if a condition has been resolved on-chain */
 export async function isConditionResolved(conditionId: string): Promise<boolean> {
-  const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
-  const denom: BigNumber = await ctf.payoutDenominator(conditionId);
-  return denom.gt(0);
+  try {
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
+    const denom: BigNumber = await ctf.payoutDenominator(conditionId);
+    return denom.gt(0);
+  } catch (err) {
+    // Stale provider — reset and retry once
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider(true));
+    const denom: BigNumber = await ctf.payoutDenominator(conditionId);
+    return denom.gt(0);
+  }
 }
 
 /** Get ERC-1155 token balance on the CTF contract */
