@@ -13,7 +13,6 @@ import {
   Chip,
 } from '@heroui/react';
 import { useMMStore } from '@/store/useMMStore';
-import type { SniperMarketInfo } from '@/lib/mm/types';
 
 function formatMinutes(mins: number): string {
   const m = Math.floor(mins);
@@ -21,48 +20,89 @@ function formatMinutes(mins: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+interface MarketRow {
+  conditionId: string;
+  cryptoAsset: string;
+  question: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  midpoint: number | null;
+  bidPrice: number | null;
+  askPrice: number | null;
+  minutesLeft: number;
+  yesHeld: number;
+  noHeld: number;
+}
+
 export function MMMarketsTable() {
-  const sniperDetail = useMMStore((s) => s.sniperDetail);
+  const detail = useMMStore((s) => s.detail);
   const scannedMarkets = useMMStore((s) => s.scannedMarkets);
 
-  const sniperMarkets: SniperMarketInfo[] = sniperDetail?.markets ?? [];
-  const hasSniperData = sniperMarkets.length > 0;
+  const isRunning = detail !== null;
+  const engineMarkets = detail?.markets ?? [];
+
+  const rows: MarketRow[] = isRunning
+    ? engineMarkets.map((m) => ({
+        conditionId: m.conditionId,
+        cryptoAsset: m.cryptoAsset,
+        question: m.question,
+        bestBid: m.bestBid,
+        bestAsk: m.bestAsk,
+        midpoint: m.midpoint,
+        bidPrice: m.bidPrice,
+        askPrice: m.askPrice,
+        minutesLeft: m.minutesLeft,
+        yesHeld: m.yesHeld,
+        noHeld: m.noHeld,
+      }))
+    : scannedMarkets.map((m) => ({
+        conditionId: m.conditionId,
+        cryptoAsset: m.cryptoAsset,
+        question: m.question,
+        bestBid: m.bestBid,
+        bestAsk: m.bestAsk,
+        midpoint: m.midpoint,
+        bidPrice: null,
+        askPrice: null,
+        minutesLeft: m.minutesLeft,
+        yesHeld: 0,
+        noHeld: 0,
+      }));
 
   return (
     <Card>
       <CardHeader className="flex justify-between items-center">
         <h3 className="text-sm font-semibold">
-          {hasSniperData ? 'Sniper Markets' : 'Scanned Markets'}
+          {isRunning ? 'Active Markets' : 'Scanned Markets'}
         </h3>
-        {hasSniperData && (
-          <div className="flex gap-2">
-            <Chip size="sm" variant="flat" color="warning">
-              {sniperMarkets.filter((m) => m.status === 'watching').length} watching
-            </Chip>
-            <Chip size="sm" variant="flat" color="success">
-              {sniperMarkets.filter((m) => m.status === 'entered').length} entered
-            </Chip>
-          </div>
+        {!isRunning && rows.length > 0 && (
+          <span className="text-[10px] text-gray-400">CLOB orderbook</span>
         )}
       </CardHeader>
       <CardBody className="pt-0">
-        {hasSniperData ? (
-          <Table
-            aria-label="Sniper markets"
-            removeWrapper
-            classNames={{ th: 'text-xs', td: 'text-xs' }}
-          >
-            <TableHeader>
-              <TableColumn>Asset</TableColumn>
-              <TableColumn>Strike</TableColumn>
-              <TableColumn>Direction</TableColumn>
-              <TableColumn>Entry</TableColumn>
-              <TableColumn>Confidence</TableColumn>
-              <TableColumn>Time Left</TableColumn>
-              <TableColumn>Status</TableColumn>
-            </TableHeader>
-            <TableBody emptyContent="No active sniper markets">
-              {sniperMarkets.map((m) => (
+        <Table
+          aria-label="MM markets"
+          removeWrapper
+          classNames={{ th: 'text-xs', td: 'text-xs' }}
+        >
+          <TableHeader>
+            <TableColumn>Asset</TableColumn>
+            <TableColumn>Question</TableColumn>
+            <TableColumn>Bid</TableColumn>
+            <TableColumn>Ask</TableColumn>
+            <TableColumn>Mid</TableColumn>
+            <TableColumn>Spread</TableColumn>
+            <TableColumn>Time Left</TableColumn>
+            <TableColumn>Inventory</TableColumn>
+          </TableHeader>
+          <TableBody emptyContent={isRunning ? 'No active markets' : 'No markets found'}>
+            {rows.map((m) => {
+              const bid = isRunning ? m.bidPrice : m.bestBid;
+              const ask = isRunning ? m.askPrice : m.bestAsk;
+              const spread = bid !== null && ask !== null
+                ? ((1 - bid - ask) * 100).toFixed(1)
+                : '--';
+              return (
                 <TableRow key={m.conditionId}>
                   <TableCell>
                     <Chip size="sm" variant="flat" color="primary">
@@ -70,124 +110,50 @@ export function MMMarketsTable() {
                     </Chip>
                   </TableCell>
                   <TableCell>
-                    <span className="font-mono">
-                      {m.strikePrice !== null ? `$${m.strikePrice.toLocaleString()}` : '--'}
+                    <span className="text-gray-700 dark:text-gray-300 truncate max-w-[200px] block">
+                      {m.question.length > 50 ? m.question.slice(0, 50) + '...' : m.question}
                     </span>
                   </TableCell>
                   <TableCell>
-                    {m.direction ? (
-                      <Chip
-                        size="sm"
-                        variant="flat"
-                        color={m.direction === 'YES' ? 'success' : 'danger'}
-                      >
-                        {m.direction}
-                      </Chip>
-                    ) : (
-                      <span className="text-gray-400">--</span>
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    {m.entryPrice !== null ? (
-                      <span className="font-mono text-blue-600">{m.entryPrice.toFixed(2)}</span>
+                    {bid !== null ? (
+                      <span className="text-green-600 font-mono">{bid.toFixed(2)}</span>
                     ) : '--'}
                   </TableCell>
                   <TableCell>
-                    {m.confidence > 0 ? (
-                      <Chip
-                        size="sm"
-                        variant="flat"
-                        color={m.confidence >= 2 ? 'success' : m.confidence >= 1 ? 'warning' : 'default'}
-                      >
-                        {m.confidence.toFixed(1)}x
-                      </Chip>
+                    {ask !== null ? (
+                      <span className="text-red-500 font-mono">{ask.toFixed(2)}</span>
                     ) : '--'}
+                  </TableCell>
+                  <TableCell>
+                    <span className="font-mono">
+                      {m.midpoint !== null ? m.midpoint.toFixed(3) : '--'}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <span className="font-mono">{spread}c</span>
                   </TableCell>
                   <TableCell>
                     <Chip
                       size="sm"
                       variant="flat"
-                      color={m.minutesLeft < 1 ? 'danger' : m.minutesLeft < 3 ? 'warning' : 'default'}
+                      color={m.minutesLeft < 2 ? 'danger' : m.minutesLeft < 5 ? 'warning' : 'default'}
                     >
                       {formatMinutes(m.minutesLeft)}
                     </Chip>
                   </TableCell>
                   <TableCell>
-                    <Chip
-                      size="sm"
-                      variant="dot"
-                      color={
-                        m.status === 'entered' ? 'success' :
-                        m.status === 'watching' ? 'warning' :
-                        'default'
-                      }
-                    >
-                      {m.status}
-                    </Chip>
+                    {isRunning ? (
+                      <div className="flex gap-1 text-[10px]">
+                        <span className="text-green-600">Y:{m.yesHeld}</span>
+                        <span className="text-red-500">N:{m.noHeld}</span>
+                      </div>
+                    ) : '--'}
                   </TableCell>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        ) : (
-          <Table
-            aria-label="Scanned markets"
-            removeWrapper
-            classNames={{ th: 'text-xs', td: 'text-xs' }}
-          >
-            <TableHeader>
-              <TableColumn>Asset</TableColumn>
-              <TableColumn>Strike</TableColumn>
-              <TableColumn>Bid</TableColumn>
-              <TableColumn>Ask</TableColumn>
-              <TableColumn>Spread</TableColumn>
-              <TableColumn>Time Left</TableColumn>
-            </TableHeader>
-            <TableBody emptyContent="No markets found">
-              {scannedMarkets.map((m) => {
-                const spread = m.bestBid !== null && m.bestAsk !== null
-                  ? ((1 - m.bestBid - m.bestAsk) * 100).toFixed(1)
-                  : '--';
-                return (
-                  <TableRow key={m.conditionId}>
-                    <TableCell>
-                      <Chip size="sm" variant="flat" color="primary">
-                        {m.cryptoAsset}
-                      </Chip>
-                    </TableCell>
-                    <TableCell>
-                      <span className="font-mono">
-                        {m.strikePrice !== null ? `$${m.strikePrice.toLocaleString()}` : '--'}
-                      </span>
-                    </TableCell>
-                    <TableCell>
-                      {m.bestBid !== null ? (
-                        <span className="text-green-600 font-mono">{m.bestBid.toFixed(2)}</span>
-                      ) : '--'}
-                    </TableCell>
-                    <TableCell>
-                      {m.bestAsk !== null ? (
-                        <span className="text-red-500 font-mono">{m.bestAsk.toFixed(2)}</span>
-                      ) : '--'}
-                    </TableCell>
-                    <TableCell>
-                      <span className="font-mono">{spread}c</span>
-                    </TableCell>
-                    <TableCell>
-                      <Chip
-                        size="sm"
-                        variant="flat"
-                        color={m.minutesLeft < 2 ? 'danger' : m.minutesLeft < 5 ? 'warning' : 'default'}
-                      >
-                        {formatMinutes(m.minutesLeft)}
-                      </Chip>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        )}
+              );
+            })}
+          </TableBody>
+        </Table>
       </CardBody>
     </Card>
   );

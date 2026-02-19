@@ -19,8 +19,8 @@ function formatTime(iso: string): string {
   });
 }
 
-export function MMLogFeed() {
-  const logs = useMMStore((s) => s.logs);
+export function SniperLogFeed() {
+  const logs = useMMStore((s) => s.sniperLogs);
   const [expanded, setExpanded] = useState(true);
 
   return (
@@ -36,21 +36,16 @@ export function MMLogFeed() {
             stroke="currentColor"
             viewBox="0 0 24 24"
           >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M9 5l7 7-7 7"
-            />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
           </svg>
-          MM Activity Log
+          Sniper Activity Log
           <span className="text-gray-400 ml-1">({logs.length})</span>
         </button>
 
         {expanded && (
           <div className="max-h-[250px] overflow-y-auto space-y-1">
             {logs.length === 0 ? (
-              <p className="text-xs text-gray-400 text-center py-4">No MM activity yet</p>
+              <p className="text-xs text-gray-400 text-center py-4">No sniper activity yet</p>
             ) : (
               [...logs].reverse().map((entry) => (
                 <div
@@ -60,12 +55,7 @@ export function MMLogFeed() {
                   <span className="text-gray-400 shrink-0 w-16 font-mono">
                     {formatTime(entry.createdAt)}
                   </span>
-                  <Chip
-                    size="sm"
-                    variant="flat"
-                    color={LEVEL_COLORS[entry.level] || 'default'}
-                    className="shrink-0"
-                  >
+                  <Chip size="sm" variant="flat" color={LEVEL_COLORS[entry.level] || 'default'} className="shrink-0">
                     {entry.event}
                   </Chip>
                   <span className="text-gray-700 dark:text-gray-300 break-words min-w-0">
