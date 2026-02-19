@@ -17,7 +17,6 @@ import type {
   SniperDetail,
   SniperMarketInfo,
   ActiveMarket,
-  MarketMode,
 } from './types';
 import { DEFAULT_SNIPER_CONFIG } from './types';
 import type { BotLogEntry } from '@/lib/bot/types';
@@ -57,6 +56,7 @@ interface SniperInstance {
   expiryTimer: ReturnType<typeof setInterval> | null;
   redeemTimer: ReturnType<typeof setInterval> | null;
   logBuffer: BotLogEntry[];
+  priceCheckRunning: boolean; // prevent overlapping checkPriceAndSnipe calls
 }
 
 // Survive Next.js HMR
@@ -135,7 +135,18 @@ function countActivePositions(inst: SniperInstance): number {
 
 async function checkPriceAndSnipe(inst: SniperInstance): Promise<void> {
   if (inst.state.status !== 'running') return;
+  // Prevent overlapping calls (interval can fire while previous is still awaiting)
+  if (inst.priceCheckRunning) return;
+  inst.priceCheckRunning = true;
 
+  try {
+    await _checkPriceAndSnipeInner(inst);
+  } finally {
+    inst.priceCheckRunning = false;
+  }
+}
+
+async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
   for (const [, market] of inst.activeMarkets) {
     if (market.entryTime !== null) continue; // already entered
 
@@ -179,17 +190,8 @@ async function checkPriceAndSnipe(inst: SniperInstance): Promise<void> {
 
       if (size < 1) continue;
 
-      // Place BUY order
-      log(inst, 'info', 'entry', `${market.cryptoAsset} ${direction} — spot $${spotPrice.toFixed(2)}, strike $${market.strikePrice.toFixed(2)}, diff ${(priceDiffPct * 100).toFixed(3)}%, ask ${book.bestAsk.toFixed(2)}, size ${size}, confidence ${confidence.toFixed(1)}x`);
-
-      await placeProfileOrder(inst.profile, {
-        tokenId,
-        side: 'BUY',
-        price: book.bestAsk,
-        size,
-      });
-
-      // Update market state
+      // Mark as entered BEFORE placing order to prevent duplicate entries
+      // from the next timer tick while awaiting placeProfileOrder
       market.direction = direction;
       market.entryPrice = book.bestAsk;
       market.entryTime = Date.now();
@@ -197,10 +199,32 @@ async function checkPriceAndSnipe(inst: SniperInstance): Promise<void> {
       market.tokenId = tokenId;
       market.held = size;
 
-      inst.state.totalTrades++;
-      inst.state.totalExposure = calcTotalExposure(inst);
+      log(inst, 'info', 'entry', `${market.cryptoAsset} ${direction} — spot $${spotPrice.toFixed(2)}, strike $${market.strikePrice.toFixed(2)}, diff ${(priceDiffPct * 100).toFixed(3)}%, ask ${book.bestAsk.toFixed(2)}, size ${size}, confidence ${confidence.toFixed(1)}x`);
 
-      log(inst, 'trade', 'buy', `BUY ${direction} ${market.cryptoAsset} @${book.bestAsk.toFixed(2)} x ${size} (${minutesLeft.toFixed(1)}m left, confidence: ${confidence.toFixed(1)}x)`);
+      try {
+        await placeProfileOrder(inst.profile, {
+          tokenId,
+          side: 'BUY',
+          price: book.bestAsk,
+          size,
+        });
+
+        inst.state.totalTrades++;
+        inst.state.totalExposure = calcTotalExposure(inst);
+
+        log(inst, 'trade', 'buy', `BUY ${direction} ${market.cryptoAsset} @${book.bestAsk.toFixed(2)} x ${size} (${minutesLeft.toFixed(1)}m left, confidence: ${confidence.toFixed(1)}x)`);
+      } catch (orderErr) {
+        // Order failed — rollback the pre-set entry state
+        market.direction = null;
+        market.entryPrice = null;
+        market.entryTime = null;
+        market.confidence = 0;
+        market.tokenId = null;
+        market.held = 0;
+
+        const msg = orderErr instanceof Error ? orderErr.message : String(orderErr);
+        log(inst, 'error', 'order', `${market.cryptoAsset} order failed: ${msg}`);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(inst, 'error', 'snipe', `${market.cryptoAsset} snipe error: ${msg}`);
@@ -225,27 +249,37 @@ function activeMarketToSniper(m: ActiveMarket): SniperMarket {
 async function refreshMarkets(inst: SniperInstance): Promise<void> {
   if (inst.state.status !== 'running') return;
 
-  try {
-    const targetWindow = inst.config.mode === '5m' ? 5 : 15;
-    // Use wider scan window: 0 to maxMinutesLeft + extra buffer for watching
-    const markets = await findActiveCryptoMarkets(
-      inst.config.assets,
-      0, // minMinutes — include markets that are about to expire
-      inst.config.maxMinutesLeft + 5, // scan buffer
-      targetWindow,
-    );
+  // Group selections by mode → assets
+  const byMode = new Map<string, Set<string>>();
+  for (const sel of inst.config.selections) {
+    const modeKey = sel.mode;
+    if (!byMode.has(modeKey)) byMode.set(modeKey, new Set());
+    byMode.get(modeKey)!.add(sel.asset);
+  }
 
-    for (const market of markets) {
-      if (inst.activeMarkets.has(market.conditionId)) continue;
+  for (const [mode, assetSet] of byMode) {
+    try {
+      const targetWindow = mode === '5m' ? 5 : 15;
+      const assets = [...assetSet] as import('./types').CryptoAsset[];
+      const markets = await findActiveCryptoMarkets(
+        assets,
+        0,
+        inst.config.maxMinutesLeft + 5,
+        targetWindow,
+      );
 
-      inst.activeMarkets.set(market.conditionId, activeMarketToSniper(market));
-      inst.state.activeMarkets = inst.activeMarkets.size;
+      for (const market of markets) {
+        if (inst.activeMarkets.has(market.conditionId)) continue;
 
-      log(inst, 'info', 'market', `Watching: ${market.cryptoAsset} — ${market.question.slice(0, 60)} (strike: $${market.strikePrice?.toLocaleString() ?? '?'}, expires ${Math.round((market.endTime.getTime() - Date.now()) / 60000)}m)`);
+        inst.activeMarkets.set(market.conditionId, activeMarketToSniper(market));
+        inst.state.activeMarkets = inst.activeMarkets.size;
+
+        log(inst, 'info', 'market', `Watching: ${market.cryptoAsset} ${mode} — ${market.question.slice(0, 60)} (strike: $${market.strikePrice?.toLocaleString() ?? '?'}, expires ${Math.round((market.endTime.getTime() - Date.now()) / 60000)}m)`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(inst, 'warn', 'scan', `Market scan failed (${mode}): ${msg}`);
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(inst, 'warn', 'scan', `Market scan failed: ${msg}`);
   }
 }
 
@@ -278,6 +312,11 @@ async function checkExpiries(inst: SniperInstance): Promise<void> {
       inst.activeMarkets.delete(conditionId);
       inst.state.activeMarkets = inst.activeMarkets.size;
     }
+  }
+
+  // Immediately scan for next markets after any expiry
+  if (inst.activeMarkets.size === 0 || [...inst.activeMarkets.values()].every((m) => m.entryTime !== null)) {
+    refreshMarkets(inst).catch(() => {});
   }
 }
 
@@ -353,8 +392,7 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
   });
   if (!dbProfile?.isActive) throw new Error('Profile not active');
 
-  const mode: MarketMode = configOverrides?.mode ?? '15m';
-  const config: SniperConfig = { ...DEFAULT_SNIPER_CONFIG, ...configOverrides, mode };
+  const config: SniperConfig = { ...DEFAULT_SNIPER_CONFIG, ...configOverrides };
 
   const inst: SniperInstance = {
     profileId,
@@ -379,11 +417,13 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
     expiryTimer: null,
     redeemTimer: null,
     logBuffer: existing?.logBuffer ?? [],
+    priceCheckRunning: false,
   };
 
   instances.set(profileId, inst);
 
-  log(inst, 'info', 'start', `Sniper started (mode: ${config.mode}, assets: ${config.assets.join(',')}, window: ${config.minMinutesLeft}-${config.maxMinutesLeft}m, minDiff: ${(config.minPriceDiffPct * 100).toFixed(2)}%, maxToken: ${config.maxTokenPrice}, maxPos: $${config.maxPositionSize})`);
+  const selLabels = config.selections.map((s) => `${s.asset} ${s.mode}`).join(', ');
+  log(inst, 'info', 'start', `Sniper started (markets: ${selLabels}, window: ${config.minMinutesLeft}-${config.maxMinutesLeft}m, minDiff: ${(config.minPriceDiffPct * 100).toFixed(2)}%, maxToken: ${config.maxTokenPrice}, maxPos: $${config.maxPositionSize})`);
 
   // Initial market scan
   await refreshMarkets(inst);

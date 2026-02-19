@@ -127,9 +127,13 @@ export interface BookSnapshot {
 
 // ─── Sniper Types ────────────────────────────────────────
 
-export interface SniperConfig {
+export interface MarketSelection {
+  asset: CryptoAsset;
   mode: MarketMode;
-  assets: CryptoAsset[];
+}
+
+export interface SniperConfig {
+  selections: MarketSelection[];
   minMinutesLeft: number;      // 0.5 (earliest entry window)
   maxMinutesLeft: number;      // 3.0 (latest entry window)
   minPriceDiffPct: number;     // 0.0015 (0.15%)
@@ -141,9 +145,22 @@ export interface SniperConfig {
   marketScanIntervalMs: number;   // 30000
 }
 
+export const ALL_MARKET_SELECTIONS: MarketSelection[] = [
+  { asset: 'BTC', mode: '5m' },
+  { asset: 'BTC', mode: '15m' },
+  { asset: 'ETH', mode: '15m' },
+  { asset: 'SOL', mode: '15m' },
+  { asset: 'XRP', mode: '15m' },
+];
+
 export const DEFAULT_SNIPER_CONFIG: SniperConfig = {
-  mode: '15m',
-  assets: ['BTC', 'ETH'],
+  selections: [
+    { asset: 'BTC', mode: '5m' },
+    { asset: 'BTC', mode: '15m' },
+    { asset: 'ETH', mode: '15m' },
+    { asset: 'SOL', mode: '15m' },
+    { asset: 'XRP', mode: '15m' },
+  ],
   minMinutesLeft: 0.5,
   maxMinutesLeft: 3.0,
   minPriceDiffPct: 0.0015,

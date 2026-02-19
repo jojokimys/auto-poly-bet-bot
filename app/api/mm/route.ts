@@ -15,9 +15,13 @@ const mmConfigSchema = z.object({
   baseSpreadCents: z.number().min(1).max(20).optional(),
 }).optional();
 
+const marketSelectionSchema = z.object({
+  asset: cryptoAssetEnum,
+  mode: z.enum(['5m', '15m']),
+});
+
 const sniperConfigSchema = z.object({
-  mode: z.enum(['5m', '15m']).optional(),
-  assets: z.array(cryptoAssetEnum).min(1).optional(),
+  selections: z.array(marketSelectionSchema).min(1).optional(),
   minMinutesLeft: z.number().min(0.1).max(10).optional(),
   maxMinutesLeft: z.number().min(0.5).max(15).optional(),
   minPriceDiffPct: z.number().min(0.0001).max(0.1).optional(),

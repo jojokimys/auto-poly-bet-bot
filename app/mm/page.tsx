@@ -21,9 +21,8 @@ export default function MMPage() {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Expiry Sniper</h2>
+      <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Market Maker</h2>
 
-      {/* Top section: Control + Chart */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-1">
           <MMControl />
@@ -33,10 +32,7 @@ export default function MMPage() {
         </div>
       </div>
 
-      {/* Active Markets */}
       <MMMarketsTable />
-
-      {/* Log Feed */}
       <MMLogFeed />
     </div>
   );
