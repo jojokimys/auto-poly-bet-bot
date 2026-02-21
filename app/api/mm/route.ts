@@ -26,8 +26,8 @@ const sniperConfigSchema = z.object({
   maxMinutesLeft: z.number().min(0.5).max(15).optional(),
   minPriceDiffPct: z.number().min(0.0001).max(0.1).optional(),
   maxTokenPrice: z.number().min(0.5).max(0.99).optional(),
-  maxPositionSize: z.number().int().min(1).max(100).optional(),
-  maxTotalExposure: z.number().min(1).max(500).optional(),
+  maxPositionPct: z.number().min(0.01).max(0.50).optional(),   // 1-50% of balance
+  maxExposurePct: z.number().min(0.10).max(1.0).optional(),    // 10-100% of balance
   maxConcurrentPositions: z.number().int().min(1).max(10).optional(),
 }).optional();
 

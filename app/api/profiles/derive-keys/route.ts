@@ -119,6 +119,23 @@ export async function POST(req: NextRequest) {
 
     const creds = await client.createOrDeriveApiKey();
 
+    // Also derive builder API keys for relayer access
+    let builderCreds: { key: string; secret: string; passphrase: string } | null = null;
+    try {
+      // Need authenticated client to create builder keys
+      const authedClient = new ClobClient(
+        env.CLOB_API_URL,
+        CHAIN_ID,
+        wallet,
+        { key: creds.key, secret: creds.secret, passphrase: creds.passphrase },
+        sigType,
+        funderAddress || undefined,
+      );
+      builderCreds = await authedClient.createBuilderApiKey();
+    } catch (err) {
+      console.warn('Failed to derive builder API keys (non-fatal):', err instanceof Error ? err.message : err);
+    }
+
     // If profileId provided, persist derived keys to the profile
     if (profileId) {
       const updateData: Record<string, string> = {
@@ -126,6 +143,11 @@ export async function POST(req: NextRequest) {
         apiSecret: creds.secret,
         apiPassphrase: creds.passphrase,
       };
+      if (builderCreds) {
+        updateData.builderApiKey = builderCreds.key;
+        updateData.builderApiSecret = builderCreds.secret;
+        updateData.builderApiPassphrase = builderCreds.passphrase;
+      }
       // Also save privateKey/funderAddress if user provided new ones
       if (parsed.data.privateKey) updateData.privateKey = parsed.data.privateKey;
       if (inputFunder !== undefined) updateData.funderAddress = funderAddress;
@@ -142,6 +164,7 @@ export async function POST(req: NextRequest) {
         apiKey: creds.key,
         apiSecret: creds.secret,
         apiPassphrase: creds.passphrase,
+        builderApiKey: builderCreds?.key ?? null,
         walletAddress: wallet.address,
         profile: toPublic(updated),
       });
@@ -151,6 +174,7 @@ export async function POST(req: NextRequest) {
       apiKey: creds.key,
       apiSecret: creds.secret,
       apiPassphrase: creds.passphrase,
+      builderApiKey: builderCreds?.key ?? null,
       walletAddress: wallet.address,
     });
   } catch (error) {
