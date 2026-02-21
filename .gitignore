@@ -2,6 +2,9 @@
 
 # dependencies
 /node_modules
+
+# trade logs
+/logs
 /.pnp
 .pnp.js
 

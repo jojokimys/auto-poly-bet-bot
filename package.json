@@ -16,7 +16,8 @@
     "redeem:login": "npx tsx scripts/redeem.ts --login"
   },
   "dependencies": {
-    "@heroui/react": "^2.8.8",
+    "@heroui/react": "^2.8.9",
+    "@polymarket/builder-relayer-client": "^0.0.8",
     "@polymarket/clob-client": "^4.3.1",
     "@prisma/client": "^6.3.1",
     "axios": "^1.7.9",
