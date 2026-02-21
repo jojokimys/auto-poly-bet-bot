@@ -470,7 +470,7 @@ async function triggerMerge(inst: MMInstance, market: ActiveMarket): Promise<voi
   try {
     log(inst, 'info', 'merge', `${market.cryptoAsset} merging YES+NO → USDC...`);
     const result = await mergePositions(
-      inst.profile.privateKey,
+      inst.profile,
       market.conditionId,
       market.negRisk,
       market.yesTokenId,
@@ -510,7 +510,7 @@ async function checkPendingRedeems(inst: MMInstance): Promise<void> {
 
       log(inst, 'info', 'redeem', `${pending.cryptoAsset} condition resolved — redeeming on-chain...`);
       const result = await redeemPositions(
-        inst.profile.privateKey,
+        inst.profile,
         conditionId,
         pending.negRisk,
         pending.yesTokenId,

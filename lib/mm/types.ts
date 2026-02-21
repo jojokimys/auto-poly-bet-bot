@@ -134,22 +134,25 @@ export interface MarketSelection {
 
 export interface SniperConfig {
   selections: MarketSelection[];
-  minMinutesLeft: number;      // 0.5 (earliest entry window)
-  maxMinutesLeft: number;      // 3.0 (latest entry window)
-  minPriceDiffPct: number;     // 0.0015 (0.15%)
-  maxTokenPrice: number;       // 0.93
-  maxPositionSize: number;     // 10 (USDC)
-  maxTotalExposure: number;    // 30 (USDC)
-  maxConcurrentPositions: number; // 3
-  priceCheckIntervalMs: number;   // 2000
-  marketScanIntervalMs: number;   // 30000
+  minMinutesLeft: number;      // 0.3 (earliest entry window)
+  maxMinutesLeft: number;      // 1.0 (latest entry window)
+  minPriceDiffPct: number;     // 0.0012 (0.12%)
+  maxTokenPrice: number;       // 0.95
+  maxPositionPct: number;      // 0.15 = 15% of balance per position
+  maxExposurePct: number;      // 0.80 = 80% of balance total exposure
+  maxConcurrentPositions: number; // 6
+  priceCheckIntervalMs: number;   // 1500
+  marketScanIntervalMs: number;   // 20000
 }
 
 export const ALL_MARKET_SELECTIONS: MarketSelection[] = [
   { asset: 'BTC', mode: '5m' },
   { asset: 'BTC', mode: '15m' },
+  { asset: 'ETH', mode: '5m' },
   { asset: 'ETH', mode: '15m' },
+  { asset: 'SOL', mode: '5m' },
   { asset: 'SOL', mode: '15m' },
+  { asset: 'XRP', mode: '5m' },
   { asset: 'XRP', mode: '15m' },
 ];
 
@@ -157,19 +160,22 @@ export const DEFAULT_SNIPER_CONFIG: SniperConfig = {
   selections: [
     { asset: 'BTC', mode: '5m' },
     { asset: 'BTC', mode: '15m' },
+    { asset: 'ETH', mode: '5m' },
     { asset: 'ETH', mode: '15m' },
+    { asset: 'SOL', mode: '5m' },
     { asset: 'SOL', mode: '15m' },
+    { asset: 'XRP', mode: '5m' },
     { asset: 'XRP', mode: '15m' },
   ],
-  minMinutesLeft: 0.5,
-  maxMinutesLeft: 3.0,
-  minPriceDiffPct: 0.0015,
-  maxTokenPrice: 0.93,
-  maxPositionSize: 10,
-  maxTotalExposure: 30,
-  maxConcurrentPositions: 3,
-  priceCheckIntervalMs: 2000,
-  marketScanIntervalMs: 30000,
+  minMinutesLeft: 0.3,       // 18s — enter even closer to expiry
+  maxMinutesLeft: 1.0,       // 60s — tight window, high certainty
+  minPriceDiffPct: 0.0012,   // 0.12% base (adaptive scaling adjusts per time)
+  maxTokenPrice: 0.95,       // accept up to 95¢ (3¢+ net profit/share after fees)
+  maxPositionPct: 0.15,      // 15% of balance per position
+  maxExposurePct: 0.80,      // 80% of balance total exposure
+  maxConcurrentPositions: 6, // 6 simultaneous positions
+  priceCheckIntervalMs: 1500, // 1.5s — faster reaction
+  marketScanIntervalMs: 20000, // 20s — find new markets faster
 };
 
 export interface SniperState {

@@ -4,42 +4,206 @@ import { Contract } from '@ethersproject/contracts';
 import { JsonRpcProvider } from '@ethersproject/providers';
 import { Wallet } from '@ethersproject/wallet';
 import { BigNumber } from '@ethersproject/bignumber';
+import { createWalletClient, http, encodeFunctionData, type Hex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { polygon } from 'viem/chains';
+import { RelayClient, RelayerTxType, type Transaction } from '@polymarket/builder-relayer-client';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
+import { getBuilderConfig } from '@/lib/config/env';
 
 const POLYGON_RPC = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+const RELAYER_URL = 'https://relayer-v2.polymarket.com';
+const CHAIN_ID = 137;
 
 // Polymarket contract addresses (Polygon mainnet)
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const USDC_E_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
-const ZERO_BYTES32 = '0x' + '00'.repeat(32);
+
+// ─── ABIs (ethers format for reads) ──────────────────────
 
 const CTF_ABI = [
-  'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external',
-  'function mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount) external',
   'function payoutDenominator(bytes32 conditionId) view returns (uint256)',
+  'function payoutNumerators(bytes32 conditionId, uint256 index) view returns (uint256)',
   'function balanceOf(address owner, uint256 id) view returns (uint256)',
 ];
 
-const NEG_RISK_ABI = [
-  'function redeemPositions(bytes32 conditionId, uint256[] amounts) public',
-  'function mergePositions(bytes32 conditionId, uint256 amount) public',
-];
+// ─── ABIs (viem format for relayer tx encoding) ──────────
+
+const CTF_REDEEM_ABI = [{
+  name: 'redeemPositions',
+  type: 'function',
+  stateMutability: 'nonpayable',
+  inputs: [
+    { name: 'collateralToken', type: 'address' },
+    { name: 'parentCollectionId', type: 'bytes32' },
+    { name: 'conditionId', type: 'bytes32' },
+    { name: 'indexSets', type: 'uint256[]' },
+  ],
+  outputs: [],
+}] as const;
+
+const CTF_MERGE_ABI = [{
+  name: 'mergePositions',
+  type: 'function',
+  stateMutability: 'nonpayable',
+  inputs: [
+    { name: 'collateralToken', type: 'address' },
+    { name: 'parentCollectionId', type: 'bytes32' },
+    { name: 'conditionId', type: 'bytes32' },
+    { name: 'partition', type: 'uint256[]' },
+    { name: 'amount', type: 'uint256' },
+  ],
+  outputs: [],
+}] as const;
+
+const NR_REDEEM_ABI = [{
+  name: 'redeemPositions',
+  type: 'function',
+  stateMutability: 'nonpayable',
+  inputs: [
+    { name: '_conditionId', type: 'bytes32' },
+    { name: '_amounts', type: 'uint256[]' },
+  ],
+  outputs: [],
+}] as const;
+
+const NR_MERGE_ABI = [{
+  name: 'mergePositions',
+  type: 'function',
+  stateMutability: 'nonpayable',
+  inputs: [
+    { name: 'conditionId', type: 'bytes32' },
+    { name: 'amount', type: 'uint256' },
+  ],
+  outputs: [],
+}] as const;
+
+// ─── Data API: Claimable Positions ──────────────────────
+
+const DATA_API_URL = 'https://data-api.polymarket.com';
+
+export interface ClaimablePosition {
+  conditionId: string;
+  asset: string;          // tokenId we hold (winning side)
+  oppositeAsset: string;  // other side tokenId
+  outcomeIndex: number;   // 0=Yes, 1=No
+  negativeRisk: boolean;
+  size: number;
+  title: string;
+  outcome: string;        // "Yes" or "No"
+}
+
+/**
+ * Fetch all redeemable positions for a wallet in a single API call.
+ * Uses Polymarket Data API — no auth needed, just wallet address.
+ */
+export async function fetchClaimablePositions(walletAddress: string): Promise<ClaimablePosition[]> {
+  try {
+    const res = await fetch(
+      `${DATA_API_URL}/positions?user=${walletAddress}&redeemable=true&sizeThreshold=0&limit=500`,
+      { cache: 'no-store' },
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!Array.isArray(data)) return [];
+
+    return data.map((p: any) => ({
+      conditionId: p.conditionId,
+      asset: p.asset,
+      oppositeAsset: p.oppositeAsset,
+      outcomeIndex: p.outcomeIndex ?? 0,
+      negativeRisk: p.negativeRisk ?? false,
+      size: parseFloat(p.size) || 0,
+      title: p.title ?? '',
+      outcome: p.outcome ?? '',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ─── On-Chain Types ─────────────────────────────────────
 
 export interface OnChainRedeemResult {
   success: boolean;
   txHash: string | null;
   error: string | null;
+  winningSide: 'YES' | 'NO' | null;
 }
+
+/** Profile info needed for relayer transactions */
+export interface RedeemProfile {
+  privateKey: string;
+  funderAddress: string;
+  signatureType?: number; // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
+  apiKey: string;
+  apiSecret: string;
+  apiPassphrase: string;
+  builderApiKey?: string;
+  builderApiSecret?: string;
+  builderApiPassphrase?: string;
+}
+
+// ─── RPC Provider (read-only) ───────────────────────────
 
 let providerCache: JsonRpcProvider | null = null;
 
+class FetchJsonRpcProvider extends JsonRpcProvider {
+  async send(method: string, params: Array<any>): Promise<any> {
+    const request = { method, params, id: 42, jsonrpc: '2.0' };
+    const res = await fetch(this.connection.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+    return json.result;
+  }
+}
+
 function getProvider(forceNew = false): JsonRpcProvider {
   if (!providerCache || forceNew) {
-    // Pass chainId explicitly to skip auto network detection (avoids NETWORK_ERROR)
-    providerCache = new JsonRpcProvider(POLYGON_RPC, 137);
+    providerCache = new FetchJsonRpcProvider(POLYGON_RPC, CHAIN_ID);
   }
   return providerCache;
 }
+
+// ─── Relayer Client ─────────────────────────────────────
+
+function createRelayClient(profile: RedeemProfile): RelayClient {
+  // Use viem WalletClient — the builder-abstract-signer expects ethers v6 or viem
+  const account = privateKeyToAccount(profile.privateKey as Hex);
+  const wallet = createWalletClient({
+    account,
+    chain: polygon,
+    transport: http(POLYGON_RPC),
+  });
+
+  // Builder config: builder creds → CLOB API creds fallback → env fallback
+  const bKey = profile.builderApiKey || profile.apiKey;
+  const bSecret = profile.builderApiSecret || profile.apiSecret;
+  const bPass = profile.builderApiPassphrase || profile.apiPassphrase;
+
+  let builderConfig: BuilderConfig | undefined;
+  if (bKey && bSecret && bPass) {
+    builderConfig = new BuilderConfig({
+      localBuilderCreds: { key: bKey, secret: bSecret, passphrase: bPass },
+    });
+  } else {
+    builderConfig = getBuilderConfig();
+  }
+
+  // Map signatureType to relayer tx type
+  const relayTxType = profile.signatureType === 2
+    ? RelayerTxType.SAFE
+    : RelayerTxType.PROXY;
+
+  return new RelayClient(RELAYER_URL, CHAIN_ID, wallet, builderConfig, relayTxType);
+}
+
+// ─── Read-only RPC helpers ──────────────────────────────
 
 /** Check if a condition has been resolved on-chain */
 export async function isConditionResolved(conditionId: string): Promise<boolean> {
@@ -47,11 +211,44 @@ export async function isConditionResolved(conditionId: string): Promise<boolean>
     const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
     const denom: BigNumber = await ctf.payoutDenominator(conditionId);
     return denom.gt(0);
-  } catch (err) {
-    // Stale provider — reset and retry once
+  } catch {
     const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider(true));
     const denom: BigNumber = await ctf.payoutDenominator(conditionId);
     return denom.gt(0);
+  }
+}
+
+export async function getWinningSide(conditionId: string): Promise<'YES' | 'NO' | null> {
+  try {
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
+    const denom: BigNumber = await ctf.payoutDenominator(conditionId);
+    if (denom.isZero()) return null;
+
+    const [yesNum, noNum]: [BigNumber, BigNumber] = await Promise.all([
+      ctf.payoutNumerators(conditionId, 0),
+      ctf.payoutNumerators(conditionId, 1),
+    ]);
+
+    if (yesNum.gt(0) && noNum.isZero()) return 'YES';
+    if (noNum.gt(0) && yesNum.isZero()) return 'NO';
+    return null;
+  } catch {
+    try {
+      const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider(true));
+      const denom: BigNumber = await ctf.payoutDenominator(conditionId);
+      if (denom.isZero()) return null;
+
+      const [yesNum, noNum]: [BigNumber, BigNumber] = await Promise.all([
+        ctf.payoutNumerators(conditionId, 0),
+        ctf.payoutNumerators(conditionId, 1),
+      ]);
+
+      if (yesNum.gt(0) && noNum.isZero()) return 'YES';
+      if (noNum.gt(0) && yesNum.isZero()) return 'NO';
+      return null;
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -61,88 +258,133 @@ export async function getTokenBalance(owner: string, tokenId: string): Promise<B
   return ctf.balanceOf(owner, tokenId);
 }
 
+// ─── Relayer-based Redeem & Merge ───────────────────────
+
 /**
- * Redeem resolved positions via on-chain contract call.
- * - Standard CTF: burns winning tokens → returns USDC
- * - NegRisk: passes explicit amounts for YES/NO tokens
+ * Redeem resolved positions via Polymarket relayer.
+ * No direct RPC write needed — relayer handles gas & submission.
  */
 export async function redeemPositions(
-  privateKey: string,
+  profile: RedeemProfile,
   conditionId: string,
   negRisk: boolean,
   yesTokenId: string,
   noTokenId: string,
 ): Promise<OnChainRedeemResult> {
   try {
-    const wallet = new Wallet(privateKey, getProvider());
+    const ownerAddress = profile.funderAddress || new Wallet(profile.privateKey).address;
 
-    // Check balances first
+    // Read balances (RPC)
     const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
     const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
-      ctf.balanceOf(wallet.address, yesTokenId),
-      ctf.balanceOf(wallet.address, noTokenId),
+      ctf.balanceOf(ownerAddress, yesTokenId),
+      ctf.balanceOf(ownerAddress, noTokenId),
     ]);
 
     if (yesBal.isZero() && noBal.isZero()) {
-      return { success: true, txHash: null, error: null }; // nothing to redeem
+      return { success: true, txHash: null, error: null, winningSide: null };
     }
 
-    let tx;
+    const winningSide = await getWinningSide(conditionId);
+
+    // Build calldata
+    let tx: Transaction;
     if (negRisk) {
-      const adapter = new Contract(NEG_RISK_ADAPTER, NEG_RISK_ABI, wallet);
-      tx = await adapter.redeemPositions(conditionId, [yesBal, noBal]);
+      const data = encodeFunctionData({
+        abi: NR_REDEEM_ABI,
+        functionName: 'redeemPositions',
+        args: [conditionId as Hex, [BigInt(yesBal.toString()), BigInt(noBal.toString())]],
+      });
+      tx = { to: NEG_RISK_ADAPTER, data, value: '0' };
     } else {
-      const ctfWriter = new Contract(CTF_ADDRESS, CTF_ABI, wallet);
-      tx = await ctfWriter.redeemPositions(USDC_E_ADDRESS, ZERO_BYTES32, conditionId, [1, 2]);
+      const data = encodeFunctionData({
+        abi: CTF_REDEEM_ABI,
+        functionName: 'redeemPositions',
+        args: [USDC_E_ADDRESS as Hex, `0x${'00'.repeat(32)}` as Hex, conditionId as Hex, [1n, 2n]],
+      });
+      tx = { to: CTF_ADDRESS, data, value: '0' };
     }
 
-    const receipt = await tx.wait();
-    return { success: receipt.status === 1, txHash: receipt.transactionHash, error: null };
+    // Submit via relayer
+    const relay = createRelayClient(profile);
+    const response = await relay.execute([tx], 'redeem positions');
+    const result = await response.wait();
+
+    if (!result) {
+      return { success: false, txHash: null, error: 'Relayer transaction timed out', winningSide };
+    }
+
+    const success = result.state === 'STATE_CONFIRMED' || result.state === 'STATE_MINED';
+    return { success, txHash: result.transactionHash || null, error: success ? null : `Relayer state: ${result.state}`, winningSide };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { success: false, txHash: null, error: msg };
+    return { success: false, txHash: null, error: msg, winningSide: null };
   }
 }
 
 /**
- * Merge equal YES + NO positions back into USDC (no resolution needed).
+ * Merge equal YES + NO positions back into USDC via relayer.
  * Used for MM round trips to recover capital immediately.
  */
 export async function mergePositions(
-  privateKey: string,
+  profile: RedeemProfile,
   conditionId: string,
   negRisk: boolean,
   yesTokenId: string,
   noTokenId: string,
 ): Promise<OnChainRedeemResult> {
   try {
-    const wallet = new Wallet(privateKey, getProvider());
+    const ownerAddress = profile.funderAddress || new Wallet(profile.privateKey).address;
 
-    // Find merge-able amount = min(yesBal, noBal)
+    // Read balances (RPC)
     const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
     const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
-      ctf.balanceOf(wallet.address, yesTokenId),
-      ctf.balanceOf(wallet.address, noTokenId),
+      ctf.balanceOf(ownerAddress, yesTokenId),
+      ctf.balanceOf(ownerAddress, noTokenId),
     ]);
 
     const mergeAmount = yesBal.lt(noBal) ? yesBal : noBal;
     if (mergeAmount.isZero()) {
-      return { success: true, txHash: null, error: null };
+      return { success: true, txHash: null, error: null, winningSide: null };
     }
 
-    let tx;
+    // Build calldata
+    let tx: Transaction;
     if (negRisk) {
-      const adapter = new Contract(NEG_RISK_ADAPTER, NEG_RISK_ABI, wallet);
-      tx = await adapter.mergePositions(conditionId, mergeAmount);
+      const data = encodeFunctionData({
+        abi: NR_MERGE_ABI,
+        functionName: 'mergePositions',
+        args: [conditionId as Hex, BigInt(mergeAmount.toString())],
+      });
+      tx = { to: NEG_RISK_ADAPTER, data, value: '0' };
     } else {
-      const ctfWriter = new Contract(CTF_ADDRESS, CTF_ABI, wallet);
-      tx = await ctfWriter.mergePositions(USDC_E_ADDRESS, ZERO_BYTES32, conditionId, [1, 2], mergeAmount);
+      const data = encodeFunctionData({
+        abi: CTF_MERGE_ABI,
+        functionName: 'mergePositions',
+        args: [
+          USDC_E_ADDRESS as Hex,
+          `0x${'00'.repeat(32)}` as Hex,
+          conditionId as Hex,
+          [1n, 2n],
+          BigInt(mergeAmount.toString()),
+        ],
+      });
+      tx = { to: CTF_ADDRESS, data, value: '0' };
     }
 
-    const receipt = await tx.wait();
-    return { success: receipt.status === 1, txHash: receipt.transactionHash, error: null };
+    // Submit via relayer
+    const relay = createRelayClient(profile);
+    const response = await relay.execute([tx], 'merge positions');
+    const result = await response.wait();
+
+    if (!result) {
+      return { success: false, txHash: null, error: 'Relayer transaction timed out', winningSide: null };
+    }
+
+    const success = result.state === 'STATE_CONFIRMED' || result.state === 'STATE_MINED';
+    return { success, txHash: result.transactionHash || null, error: success ? null : `Relayer state: ${result.state}`, winningSide: null };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { success: false, txHash: null, error: msg };
+    return { success: false, txHash: null, error: msg, winningSide: null };
   }
 }

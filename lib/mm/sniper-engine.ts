@@ -4,12 +4,15 @@ import { prisma } from '@/lib/db/prisma';
 import {
   loadProfile,
   placeProfileOrder,
+  getProfileBalance,
   type ProfileCredentials,
 } from '@/lib/bot/profile-client';
 import { getCryptoPrice } from '@/lib/polymarket/binance';
-import { isConditionResolved, redeemPositions } from '@/lib/polymarket/redeem';
+import { redeemPositions, fetchClaimablePositions } from '@/lib/polymarket/redeem';
 import { fetchBestBidAsk } from '@/lib/bot/orderbook';
+import { Wallet } from '@ethersproject/wallet';
 import { findActiveCryptoMarkets } from './market-finder';
+import { logTrade } from './trade-logger';
 import type {
   SniperState,
   SniperConfig,
@@ -38,6 +41,7 @@ interface PendingRedeem {
   yesTokenId: string;
   noTokenId: string;
   cryptoAsset: string;
+  direction: 'YES' | 'NO';
   entryPrice: number;
   held: number;
   addedAt: number;
@@ -54,9 +58,12 @@ interface SniperInstance {
   priceCheckTimer: ReturnType<typeof setInterval> | null;
   marketScanTimer: ReturnType<typeof setInterval> | null;
   expiryTimer: ReturnType<typeof setInterval> | null;
-  redeemTimer: ReturnType<typeof setInterval> | null;
+  claimTimer: ReturnType<typeof setInterval> | null;
   logBuffer: BotLogEntry[];
   priceCheckRunning: boolean; // prevent overlapping checkPriceAndSnipe calls
+  claimScanRunning: boolean;  // prevent overlapping auto-claim scans
+  lastBalance: number;        // cached balance for position sizing
+  lastBalanceAt: number;      // timestamp of last balance fetch
 }
 
 // Survive Next.js HMR
@@ -99,13 +106,77 @@ function log(
   else console.log(prefix, message, data ?? '');
 }
 
-// ─── Position Sizing ─────────────────────────────────────
+// ─── Asset Volatility Multiplier ─────────────────────────
+// Altcoins are more volatile than BTC — same priceDiff is less "safe".
+// Higher multiplier = stricter threshold = fewer but higher-quality entries.
+// Based on typical 1-minute price swing ranges:
+//   BTC ~0.03-0.05%, ETH ~0.05-0.08%, SOL ~0.10-0.20%, XRP ~0.08-0.15%
 
-function calcPositionSize(priceDiffPct: number, config: SniperConfig): number {
+const ASSET_VOLATILITY_MULT: Record<string, number> = {
+  BTC: 1.0,    // baseline — most stable
+  ETH: 1.2,    // slightly more volatile
+  SOL: 1.6,    // more volatile but still tradeable
+  XRP: 1.4,    // moderate volatility
+};
+
+// ─── Adaptive Threshold ──────────────────────────────────
+// Near expiry → lower threshold (price has less time to reverse)
+// Further from expiry → higher threshold (need more safety margin)
+// Asset volatility scales the base diff so altcoins need bigger leads.
+
+function getAdaptiveMinDiff(minutesLeft: number, baseDiff: number, asset: string): number {
+  const volMult = ASSET_VOLATILITY_MULT[asset] ?? 1.5;
+  const assetDiff = baseDiff * volMult;
+
+  // 0.3-1.0m window — 6 tiers for fine-grained control
+  if (minutesLeft <= 0.35) return assetDiff * 0.35;  // ~20s, 거의 확정
+  if (minutesLeft <= 0.45) return assetDiff * 0.50;  // ~27s
+  if (minutesLeft <= 0.55) return assetDiff * 0.65;  // ~33s
+  if (minutesLeft <= 0.70) return assetDiff * 0.80;  // ~42s
+  if (minutesLeft <= 0.85) return assetDiff * 0.90;  // ~51s
+  return assetDiff;                                    // ~60s, 풀 기준
+}
+
+// ─── Balance Cache ───────────────────────────────────────
+
+const BALANCE_CACHE_MS = 10_000; // 10s cache to avoid excessive API calls
+
+async function getCachedBalance(inst: SniperInstance): Promise<number> {
+  if (Date.now() - inst.lastBalanceAt < BALANCE_CACHE_MS) return inst.lastBalance;
+  try {
+    const balance = await getProfileBalance(inst.profile);
+    inst.lastBalance = balance;
+    inst.lastBalanceAt = Date.now();
+    return balance;
+  } catch {
+    return inst.lastBalance; // fallback to last known balance
+  }
+}
+
+// ─── Position Sizing ─────────────────────────────────────
+// Scales with price confidence, time proximity, AND available balance
+
+function calcPositionSize(priceDiffPct: number, minutesLeft: number, balance: number, config: SniperConfig): number {
+  const maxPosition = balance * config.maxPositionPct;
+  if (maxPosition < 1) return 0; // balance too low
+
   const absDiff = Math.abs(priceDiffPct);
-  if (absDiff >= 0.005) return config.maxPositionSize;       // > 0.50%
-  if (absDiff >= 0.003) return Math.min(7, config.maxPositionSize); // 0.30-0.50%
-  return Math.min(5, config.maxPositionSize);                 // 0.15-0.30%
+
+  // Base size from price diff confidence
+  let size: number;
+  if (absDiff >= 0.005) size = maxPosition;             // > 0.50% — max conviction
+  else if (absDiff >= 0.003) size = maxPosition * 0.75; // 0.30-0.50%
+  else if (absDiff >= 0.002) size = maxPosition * 0.55; // 0.20-0.30%
+  else size = maxPosition * 0.40;                        // 0.12-0.20%
+
+  // Time multiplier: 0.3-1.0m range, closer = bigger
+  if (minutesLeft <= 0.35) size *= 1.4;      // +40% — ~20s, 거의 확정
+  else if (minutesLeft <= 0.50) size *= 1.25; // +25% — ~30s
+  else if (minutesLeft <= 0.65) size *= 1.10; // +10% — ~40s
+  else if (minutesLeft <= 0.80) size *= 1.0;  // base — ~48s
+  else size *= 0.85;                          // -15% — ~60s, 약간 보수적
+
+  return Math.min(Math.max(1, Math.floor(size)), Math.floor(maxPosition));
 }
 
 // ─── Exposure Calculation ────────────────────────────────
@@ -147,6 +218,12 @@ async function checkPriceAndSnipe(inst: SniperInstance): Promise<void> {
 }
 
 async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
+  // Fetch balance once per cycle (cached 10s)
+  const balance = await getCachedBalance(inst);
+  if (balance < 1) return; // no funds
+
+  const maxExposure = balance * inst.config.maxExposurePct;
+
   for (const [, market] of inst.activeMarkets) {
     if (market.entryTime !== null) continue; // already entered
 
@@ -156,10 +233,10 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
     // Concurrent position limit
     if (countActivePositions(inst) >= inst.config.maxConcurrentPositions) continue;
 
-    // Exposure limit
+    // Exposure limit (percentage of balance)
     const exposure = calcTotalExposure(inst);
     inst.state.totalExposure = exposure;
-    if (exposure >= inst.config.maxTotalExposure) continue;
+    if (exposure >= maxExposure) continue;
 
     const symbol = ASSET_TO_SYMBOL[market.cryptoAsset];
     if (!symbol) continue;
@@ -169,8 +246,21 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
       const spotPrice = await getCryptoPrice(symbol);
       const priceDiffPct = (spotPrice - market.strikePrice) / market.strikePrice;
 
-      if (Math.abs(priceDiffPct) < inst.config.minPriceDiffPct) {
-        market.confidence = Math.abs(priceDiffPct) / inst.config.minPriceDiffPct;
+      const adaptiveDiff = getAdaptiveMinDiff(minutesLeft, inst.config.minPriceDiffPct, market.cryptoAsset);
+      if (Math.abs(priceDiffPct) < adaptiveDiff) {
+        market.confidence = Math.abs(priceDiffPct) / adaptiveDiff;
+        // Log skip reason once when confidence is close (>50%) to help debug
+        if (market.confidence >= 0.5 && minutesLeft <= 1.0) {
+          log(inst, 'info', 'skip-threshold', `${market.cryptoAsset} diff ${(priceDiffPct * 100).toFixed(3)}% < threshold ${(adaptiveDiff * 100).toFixed(3)}% (${(market.confidence * 100).toFixed(0)}% conf, ${minutesLeft.toFixed(2)}m left)`);
+          logTrade({
+            event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+            asset: market.cryptoAsset, conditionId: market.conditionId,
+            reason: 'threshold', secondsLeft: Math.round(minutesLeft * 60),
+            spotPrice, strikePrice: market.strikePrice,
+            priceDiffPct, adaptiveThreshold: adaptiveDiff,
+            confidence: market.confidence,
+          });
+        }
         continue;
       }
 
@@ -181,11 +271,20 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
       const book = await fetchBestBidAsk(tokenId);
       if (!book?.bestAsk || book.bestAsk > inst.config.maxTokenPrice) {
         log(inst, 'info', 'skip', `${market.cryptoAsset} ${direction} ask ${book?.bestAsk?.toFixed(2) ?? 'N/A'} > max ${inst.config.maxTokenPrice} — skipping`);
+        logTrade({
+          event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: market.cryptoAsset, conditionId: market.conditionId,
+          reason: 'price-too-high', secondsLeft: Math.round(minutesLeft * 60),
+          spotPrice, strikePrice: market.strikePrice!,
+          priceDiffPct, adaptiveThreshold: adaptiveDiff,
+          confidence: Math.abs(priceDiffPct) / adaptiveDiff,
+          askPrice: book?.bestAsk ?? undefined, maxTokenPrice: inst.config.maxTokenPrice,
+        });
         continue;
       }
 
-      const confidence = Math.abs(priceDiffPct) / inst.config.minPriceDiffPct;
-      const usdcSize = calcPositionSize(priceDiffPct, inst.config);
+      const confidence = Math.abs(priceDiffPct) / adaptiveDiff;
+      const usdcSize = calcPositionSize(priceDiffPct, minutesLeft, balance, inst.config);
       const size = Math.floor(usdcSize / book.bestAsk);
 
       if (size < 1) continue;
@@ -199,7 +298,7 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
       market.tokenId = tokenId;
       market.held = size;
 
-      log(inst, 'info', 'entry', `${market.cryptoAsset} ${direction} — spot $${spotPrice.toFixed(2)}, strike $${market.strikePrice.toFixed(2)}, diff ${(priceDiffPct * 100).toFixed(3)}%, ask ${book.bestAsk.toFixed(2)}, size ${size}, confidence ${confidence.toFixed(1)}x`);
+      log(inst, 'info', 'entry', `${market.cryptoAsset} ${direction} — spot $${spotPrice.toFixed(2)}, strike $${market.strikePrice.toFixed(2)}, diff ${(priceDiffPct * 100).toFixed(3)}%, ask ${book.bestAsk.toFixed(2)}, size ${size} ($${usdcSize.toFixed(1)}, ${(inst.config.maxPositionPct * 100).toFixed(0)}% of $${balance.toFixed(1)}), confidence ${confidence.toFixed(1)}x`);
 
       try {
         await placeProfileOrder(inst.profile, {
@@ -207,12 +306,25 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
           side: 'BUY',
           price: book.bestAsk,
           size,
+          taker: true,  // aggressive fill — <1m to expiry, can't risk maker miss
         });
 
         inst.state.totalTrades++;
         inst.state.totalExposure = calcTotalExposure(inst);
 
         log(inst, 'trade', 'buy', `BUY ${direction} ${market.cryptoAsset} @${book.bestAsk.toFixed(2)} x ${size} (${minutesLeft.toFixed(1)}m left, confidence: ${confidence.toFixed(1)}x)`);
+        logTrade({
+          event: 'entry', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: market.cryptoAsset, mode: market.question.includes('5 min') ? '5m' : '15m',
+          conditionId: market.conditionId, direction,
+          spotPrice, strikePrice: market.strikePrice!,
+          priceDiffPct, adaptiveThreshold: adaptiveDiff, confidence,
+          secondsLeft: Math.round(minutesLeft * 60),
+          askPrice: book.bestAsk, bidPrice: book.bestBid, spread: book.bestBid ? book.bestAsk - book.bestBid : null,
+          size, usdcSize, balance, totalExposure: calcTotalExposure(inst),
+          positionSizePct: usdcSize / balance,
+          expectedPnl: (1 - book.bestAsk) * size - 0.02 * size,
+        });
       } catch (orderErr) {
         // Order failed — rollback the pre-set entry state
         market.direction = null;
@@ -224,6 +336,14 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
 
         const msg = orderErr instanceof Error ? orderErr.message : String(orderErr);
         log(inst, 'error', 'order', `${market.cryptoAsset} order failed: ${msg}`);
+        logTrade({
+          event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: market.cryptoAsset, conditionId: market.conditionId,
+          reason: 'order-failed', secondsLeft: Math.round(minutesLeft * 60),
+          spotPrice, strikePrice: market.strikePrice!,
+          priceDiffPct, adaptiveThreshold: adaptiveDiff, confidence,
+          askPrice: book.bestAsk, error: msg,
+        });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -293,13 +413,14 @@ async function checkExpiries(inst: SniperInstance): Promise<void> {
 
     // Market expired — remove and queue redeem if we have a position
     if (msLeft <= 0) {
-      if (market.entryTime !== null && market.held > 0) {
+      if (market.entryTime !== null && market.held > 0 && market.direction) {
         inst.pendingRedeems.set(conditionId, {
           conditionId,
           negRisk: market.negRisk,
           yesTokenId: market.yesTokenId,
           noTokenId: market.noTokenId,
           cryptoAsset: market.cryptoAsset,
+          direction: market.direction,
           entryPrice: market.entryPrice ?? 0,
           held: market.held,
           addedAt: now,
@@ -320,58 +441,120 @@ async function checkExpiries(inst: SniperInstance): Promise<void> {
   }
 }
 
-// ─── Redeem Check ────────────────────────────────────────
+// ─── Pending Redeem Cleanup ─────────────────────────────
+// Just expire old pending redeems. Actual claiming is done by the Data API scanner.
 
-async function checkPendingRedeems(inst: SniperInstance): Promise<void> {
-  if (inst.pendingRedeems.size === 0) return;
-
-  const MAX_PENDING_MS = 60 * 60_000; // 60 min max wait
-
+function cleanupPendingRedeems(inst: SniperInstance): void {
+  const MAX_PENDING_MS = 180 * 60_000;
   for (const [conditionId, pending] of inst.pendingRedeems) {
     if (Date.now() - pending.addedAt > MAX_PENDING_MS) {
-      log(inst, 'warn', 'redeem', `${pending.cryptoAsset} pending redeem timed out (60m) — removing`);
+      log(inst, 'warn', 'redeem', `${pending.cryptoAsset} pending redeem timed out (180m) — removing`);
       inst.pendingRedeems.delete(conditionId);
-      continue;
     }
+  }
+}
 
-    try {
-      const resolved = await isConditionResolved(conditionId);
-      if (!resolved) continue;
+// ─── Auto-Claim Scanner ─────────────────────────────────
+// Uses Polymarket Data API to get claimable positions in ONE call.
+// Also resolves pendingRedeems for PnL tracking.
+// Runs every 2 min.
 
-      log(inst, 'info', 'redeem', `${pending.cryptoAsset} condition resolved — redeeming on-chain...`);
-      const result = await redeemPositions(
-        inst.profile.privateKey,
-        conditionId,
-        pending.negRisk,
-        pending.yesTokenId,
-        pending.noTokenId,
-      );
+async function scanAndClaimResolved(inst: SniperInstance): Promise<void> {
+  if (inst.state.status !== 'running') return;
+  if (inst.claimScanRunning) return;
+  inst.claimScanRunning = true;
 
-      if (result.success) {
-        // Assume win: token resolved to $1, profit = (1 - entryPrice) * held - 2% fee
+  try {
+    // Cleanup old pending redeems first
+    cleanupPendingRedeems(inst);
+
+    // Use proxy address (funderAddress) if available, otherwise derive from private key
+    const walletAddress = inst.profile.funderAddress || new Wallet(inst.profile.privateKey).address;
+    const claimable = await fetchClaimablePositions(walletAddress);
+
+    // Resolve pendingRedeems that are now claimable (track PnL)
+    for (const pos of claimable) {
+      const pending = inst.pendingRedeems.get(pos.conditionId);
+      if (pending) {
+        // We know this position won (it's claimable = redeemable = winning side)
         const grossProfit = (1 - pending.entryPrice) * pending.held;
-        const fee = 0.02 * pending.held; // 2% fee on winning
+        const fee = 0.02 * pending.held;
         const netProfit = grossProfit - fee;
-
         inst.state.wins++;
         inst.state.grossPnl += netProfit;
+        log(inst, 'trade', 'redeem', `${pending.cryptoAsset} WIN! ${pending.direction} ${pending.held} shares @${pending.entryPrice.toFixed(2)} → net +$${netProfit.toFixed(3)}`);
+        logTrade({
+          event: 'exit', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: pending.cryptoAsset, conditionId: pos.conditionId,
+          direction: pending.direction, entryPrice: pending.entryPrice,
+          held: pending.held, result: 'win', pnl: netProfit,
+          holdDurationSec: Math.round((Date.now() - pending.addedAt) / 1000),
+        });
+        inst.pendingRedeems.delete(pos.conditionId);
+        inst.state.totalExposure = calcTotalExposure(inst);
+      }
+    }
 
-        const msg = result.txHash ? `tx: ${result.txHash.slice(0, 10)}...` : 'no tokens to redeem';
-        log(inst, 'trade', 'redeem', `${pending.cryptoAsset} WIN! redeemed ${pending.held} shares @${pending.entryPrice.toFixed(2)} → net +$${netProfit.toFixed(3)} ${msg}`);
-      } else {
-        // Lost — tokens are worthless
+    // Also mark expired pendingRedeems that are NOT claimable as losses
+    // (if market expired > 5 min ago and not in claimable list → lost)
+    const claimableIds = new Set(claimable.map((c) => c.conditionId));
+    for (const [conditionId, pending] of inst.pendingRedeems) {
+      const age = Date.now() - pending.addedAt;
+      if (age > 5 * 60_000 && !claimableIds.has(conditionId)) {
         const loss = pending.entryPrice * pending.held;
         inst.state.losses++;
         inst.state.grossPnl -= loss;
-        log(inst, 'trade', 'redeem', `${pending.cryptoAsset} LOSS — ${pending.held} shares @${pending.entryPrice.toFixed(2)} → -$${loss.toFixed(3)}: ${result.error}`);
+        log(inst, 'trade', 'redeem', `${pending.cryptoAsset} LOSS — ${pending.direction} ${pending.held} shares @${pending.entryPrice.toFixed(2)} → -$${loss.toFixed(3)}`);
+        logTrade({
+          event: 'exit', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: pending.cryptoAsset, conditionId,
+          direction: pending.direction, entryPrice: pending.entryPrice,
+          held: pending.held, result: 'loss', pnl: -loss,
+          holdDurationSec: Math.round((Date.now() - pending.addedAt) / 1000),
+        });
+        inst.pendingRedeems.delete(conditionId);
+        inst.state.totalExposure = calcTotalExposure(inst);
       }
-
-      inst.pendingRedeems.delete(conditionId);
-      inst.state.totalExposure = calcTotalExposure(inst);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log(inst, 'warn', 'redeem', `${pending.cryptoAsset} redeem check error: ${msg}`);
     }
+
+    if (claimable.length === 0) return;
+
+    log(inst, 'info', 'auto-claim', `Found ${claimable.length} claimable position(s) — redeeming...`);
+    let claimed = 0;
+
+    for (const pos of claimable) {
+      try {
+        const yesTokenId = pos.outcomeIndex === 0 ? pos.asset : pos.oppositeAsset;
+        const noTokenId = pos.outcomeIndex === 1 ? pos.asset : pos.oppositeAsset;
+
+        const result = await redeemPositions(
+          inst.profile,
+          pos.conditionId,
+          pos.negativeRisk,
+          yesTokenId,
+          noTokenId,
+        );
+
+        if (result.success && result.txHash) {
+          claimed++;
+          log(inst, 'trade', 'auto-claim', `Claimed "${pos.title}" (${pos.outcome}, ${pos.size} shares) → tx: ${result.txHash.slice(0, 10)}...`);
+        } else if (!result.success) {
+          log(inst, 'warn', 'auto-claim', `Claim failed "${pos.title}": ${result.error}`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(inst, 'warn', 'auto-claim', `Error claiming "${pos.title}": ${msg}`);
+      }
+    }
+
+    if (claimed > 0) {
+      log(inst, 'info', 'auto-claim', `Auto-claim done: ${claimed}/${claimable.length} redeemed`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(inst, 'warn', 'auto-claim', `Auto-claim scan error: ${msg}`);
+  } finally {
+    inst.claimScanRunning = false;
   }
 }
 
@@ -415,15 +598,24 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
     priceCheckTimer: null,
     marketScanTimer: null,
     expiryTimer: null,
-    redeemTimer: null,
+    claimTimer: null,
     logBuffer: existing?.logBuffer ?? [],
     priceCheckRunning: false,
+    claimScanRunning: false,
+    lastBalance: 0,
+    lastBalanceAt: 0,
   };
 
   instances.set(profileId, inst);
 
+  // Fetch initial balance
+  try {
+    inst.lastBalance = await getProfileBalance(profile);
+    inst.lastBalanceAt = Date.now();
+  } catch { /* will be fetched on first price check */ }
+
   const selLabels = config.selections.map((s) => `${s.asset} ${s.mode}`).join(', ');
-  log(inst, 'info', 'start', `Sniper started (markets: ${selLabels}, window: ${config.minMinutesLeft}-${config.maxMinutesLeft}m, minDiff: ${(config.minPriceDiffPct * 100).toFixed(2)}%, maxToken: ${config.maxTokenPrice}, maxPos: $${config.maxPositionSize})`);
+  log(inst, 'info', 'start', `Sniper started (balance: $${inst.lastBalance.toFixed(2)}, markets: ${selLabels}, window: ${config.minMinutesLeft}-${config.maxMinutesLeft}m, posSize: ${(config.maxPositionPct * 100).toFixed(0)}%, exposure: ${(config.maxExposurePct * 100).toFixed(0)}%)`);
 
   // Initial market scan
   await refreshMarkets(inst);
@@ -432,7 +624,10 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
   inst.priceCheckTimer = setInterval(() => checkPriceAndSnipe(inst), config.priceCheckIntervalMs);
   inst.marketScanTimer = setInterval(() => refreshMarkets(inst), config.marketScanIntervalMs);
   inst.expiryTimer = setInterval(() => checkExpiries(inst), 5000);
-  inst.redeemTimer = setInterval(() => checkPendingRedeems(inst), 30000);
+  inst.claimTimer = setInterval(() => scanAndClaimResolved(inst), 120_000); // every 2 min (Data API only, no RPC)
+
+  // Run initial auto-claim scan after 10s (catch positions from previous sessions)
+  setTimeout(() => scanAndClaimResolved(inst), 10_000);
 
   return { ...inst.state };
 }
@@ -458,7 +653,7 @@ export async function stopSniper(profileId: string): Promise<SniperState> {
   if (inst.priceCheckTimer) clearInterval(inst.priceCheckTimer);
   if (inst.marketScanTimer) clearInterval(inst.marketScanTimer);
   if (inst.expiryTimer) clearInterval(inst.expiryTimer);
-  if (inst.redeemTimer) clearInterval(inst.redeemTimer);
+  if (inst.claimTimer) clearInterval(inst.claimTimer);
 
   log(inst, 'info', 'stop', `Sniper stopped (trades: ${inst.state.totalTrades}, wins: ${inst.state.wins}, losses: ${inst.state.losses}, PnL: $${inst.state.grossPnl.toFixed(3)})`);
 
