@@ -219,28 +219,38 @@ async function getTokenMeta(client: ClobClient, tokenId: string): Promise<{ tick
   return { tickSize, negRisk };
 }
 
-/** Place an order for a specific profile (maker-enforced) */
+/** Place an order for a specific profile.
+ *  - Default (taker=false): maker-enforced — price adjusted to stay on passive side of spread.
+ *  - taker=true: aggressive — buys AT bestAsk / sells AT bestBid for guaranteed fill.
+ */
 export async function placeProfileOrder(
   profile: ProfileCredentials,
-  params: { tokenId: string; side: 'BUY' | 'SELL'; price: number; size: number }
+  params: { tokenId: string; side: 'BUY' | 'SELL'; price: number; size: number; taker?: boolean }
 ) {
   trackClobAuthCall(); // createAndPostOrder
   const client = getClientForProfile(profile);
   const { tickSize, negRisk } = await getTokenMeta(client, params.tokenId);
 
-  // Maker enforcement: ensure price doesn't cross the spread
   const tick = parseFloat(tickSize);
   let adjustedPrice = params.price;
 
-  const book = await fetchBestBidAsk(params.tokenId);
-  if (book) {
-    if (params.side === 'BUY' && book.bestAsk !== null && params.price >= book.bestAsk) {
-      adjustedPrice = book.bestAsk - tick;
-      console.log(`[maker] BUY price adjusted: ${params.price} → ${adjustedPrice} (bestAsk: ${book.bestAsk})`);
-    }
-    if (params.side === 'SELL' && book.bestBid !== null && params.price <= book.bestBid) {
-      adjustedPrice = book.bestBid + tick;
-      console.log(`[maker] SELL price adjusted: ${params.price} → ${adjustedPrice} (bestBid: ${book.bestBid})`);
+  if (params.taker) {
+    // Taker mode: use caller's price directly (already set to bestAsk by sniper).
+    // Do NOT re-fetch orderbook — price can spike between check and order.
+    // params.price acts as a hard cap.
+    adjustedPrice = params.price;
+  } else {
+    // Maker enforcement: ensure price doesn't cross the spread
+    const book = await fetchBestBidAsk(params.tokenId);
+    if (book) {
+      if (params.side === 'BUY' && book.bestAsk !== null && params.price >= book.bestAsk) {
+        adjustedPrice = book.bestAsk - tick;
+        console.log(`[maker] BUY price adjusted: ${params.price} → ${adjustedPrice} (bestAsk: ${book.bestAsk})`);
+      }
+      if (params.side === 'SELL' && book.bestBid !== null && params.price <= book.bestBid) {
+        adjustedPrice = book.bestBid + tick;
+        console.log(`[maker] SELL price adjusted: ${params.price} → ${adjustedPrice} (bestBid: ${book.bestBid})`);
+      }
     }
   }
 

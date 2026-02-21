@@ -281,7 +281,7 @@ async function runCycle(instance: BotInstance) {
             } catch { /* fallback: both set to c.tokenId — standard CTF still works with indexSets */ }
 
             const result = await redeemOnChain(
-              profile!.privateKey,
+              profile!,
               c.conditionId,
               negRisk,
               yesTokenId,
