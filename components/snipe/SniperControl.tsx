@@ -36,7 +36,8 @@ export function SniperControl() {
   const [selectedSelections, setSelectedSelections] = useState<Set<string>>(
     () => new Set(DEFAULT_SNIPER_CONFIG.selections.map(selKey))
   );
-  const [maxPositionSize, setMaxPositionSize] = useState(DEFAULT_SNIPER_CONFIG.maxPositionSize);
+  const [maxPositionPct, setMaxPositionPct] = useState(DEFAULT_SNIPER_CONFIG.maxPositionPct * 100);
+  const [maxExposurePct, setMaxExposurePct] = useState(DEFAULT_SNIPER_CONFIG.maxExposurePct * 100);
   const [minPriceDiffPct, setMinPriceDiffPct] = useState(DEFAULT_SNIPER_CONFIG.minPriceDiffPct * 100);
 
   const activeProfiles = profiles.filter((p) => p.isActive && p.hasPrivateKey && p.hasApiCredentials);
@@ -70,7 +71,8 @@ export function SniperControl() {
     const selections = ALL_MARKET_SELECTIONS.filter((s) => selectedSelections.has(selKey(s)));
     startSniper(selectedProfileId, {
       selections,
-      maxPositionSize,
+      maxPositionPct: maxPositionPct / 100,
+      maxExposurePct: maxExposurePct / 100,
       minPriceDiffPct: minPriceDiffPct / 100,
     });
   };
@@ -161,10 +163,10 @@ export function SniperControl() {
           </div>
 
           <div>
-            <p className="text-[11px] text-gray-500 mb-1.5">Max Position Size</p>
+            <p className="text-[11px] text-gray-500 mb-1.5">Position Size</p>
             {isRunning ? (
               <p className="text-sm font-mono font-semibold text-gray-900 dark:text-white">
-                ${runningConfig?.maxPositionSize ?? '--'}
+                {runningConfig ? (runningConfig.maxPositionPct * 100).toFixed(0) : '--'}%
               </p>
             ) : (
               <Input
@@ -172,13 +174,38 @@ export function SniperControl() {
                 size="sm"
                 variant="bordered"
                 min={1}
-                max={100}
-                value={String(maxPositionSize)}
+                max={50}
+                step={1}
+                value={String(maxPositionPct)}
                 onValueChange={(v) => {
-                  const n = parseInt(v, 10);
-                  if (n > 0 && n <= 100) setMaxPositionSize(n);
+                  const n = parseFloat(v);
+                  if (n > 0 && n <= 50) setMaxPositionPct(n);
                 }}
-                endContent={<span className="text-[10px] text-gray-400">USDC</span>}
+                endContent={<span className="text-[10px] text-gray-400">% of bal</span>}
+              />
+            )}
+          </div>
+
+          <div>
+            <p className="text-[11px] text-gray-500 mb-1.5">Max Exposure</p>
+            {isRunning ? (
+              <p className="text-sm font-mono font-semibold text-gray-900 dark:text-white">
+                {runningConfig ? (runningConfig.maxExposurePct * 100).toFixed(0) : '--'}%
+              </p>
+            ) : (
+              <Input
+                type="number"
+                size="sm"
+                variant="bordered"
+                min={10}
+                max={100}
+                step={5}
+                value={String(maxExposurePct)}
+                onValueChange={(v) => {
+                  const n = parseFloat(v);
+                  if (n >= 10 && n <= 100) setMaxExposurePct(n);
+                }}
+                endContent={<span className="text-[10px] text-gray-400">% of bal</span>}
               />
             )}
           </div>
@@ -243,7 +270,7 @@ export function SniperControl() {
           <div className="text-[11px] text-gray-500 space-y-1">
             <div className="flex justify-between">
               <span>Exposure</span>
-              <span className="font-mono">${selectedState?.totalExposure?.toFixed(2) ?? '0.00'} / ${runningConfig?.maxTotalExposure ?? 30}</span>
+              <span className="font-mono">${selectedState?.totalExposure?.toFixed(2) ?? '0.00'} ({runningConfig ? (runningConfig.maxExposurePct * 100).toFixed(0) : '--'}% cap)</span>
             </div>
             <div className="flex justify-between">
               <span>W / L</span>
