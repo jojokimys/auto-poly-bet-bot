@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { startMM, stopMM, getMMState, getMMDetail, getMMLogs } from '@/lib/mm/engine';
-import { startSniper, stopSniper, getSniperState, getSniperDetail, getSniperLogs } from '@/lib/mm/sniper-engine';
 import { findActiveCryptoMarkets } from '@/lib/mm/market-finder';
 import { fetchBestBidAsk } from '@/lib/bot/orderbook';
 import { prisma } from '@/lib/db/prisma';
@@ -15,22 +14,6 @@ const mmConfigSchema = z.object({
   baseSpreadCents: z.number().min(1).max(20).optional(),
 }).optional();
 
-const marketSelectionSchema = z.object({
-  asset: cryptoAssetEnum,
-  mode: z.enum(['5m', '15m']),
-});
-
-const sniperConfigSchema = z.object({
-  selections: z.array(marketSelectionSchema).min(1).optional(),
-  minMinutesLeft: z.number().min(0.1).max(10).optional(),
-  maxMinutesLeft: z.number().min(0.5).max(15).optional(),
-  minPriceDiffPct: z.number().min(0.0001).max(0.1).optional(),
-  maxTokenPrice: z.number().min(0.5).max(0.99).optional(),
-  maxPositionPct: z.number().min(0.01).max(0.50).optional(),   // 1-50% of balance
-  maxExposurePct: z.number().min(0.10).max(1.0).optional(),    // 10-100% of balance
-  maxConcurrentPositions: z.number().int().min(1).max(10).optional(),
-}).optional();
-
 const mmActionSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('start'),
@@ -41,15 +24,6 @@ const mmActionSchema = z.discriminatedUnion('action', [
     action: z.literal('stop'),
     profileId: z.string().min(1),
   }),
-  z.object({
-    action: z.literal('start-sniper'),
-    profileId: z.string().min(1),
-    config: sniperConfigSchema,
-  }),
-  z.object({
-    action: z.literal('stop-sniper'),
-    profileId: z.string().min(1),
-  }),
 ]);
 
 export async function GET(req: NextRequest) {
@@ -58,10 +32,6 @@ export async function GET(req: NextRequest) {
 
   if (logsOnly) {
     const limit = parseInt(req.nextUrl.searchParams.get('limit') ?? '50', 10);
-    const sniperLogs = req.nextUrl.searchParams.get('sniper') === 'true';
-    if (sniperLogs) {
-      return NextResponse.json({ logs: getSniperLogs(profileId, limit) });
-    }
     return NextResponse.json({ logs: getMMLogs(profileId, limit) });
   }
 
@@ -113,12 +83,6 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // Sniper detail
-  if (req.nextUrl.searchParams.get('sniperDetail') === 'true' && profileId) {
-    const d = getSniperDetail(profileId);
-    return NextResponse.json({ sniperDetail: d });
-  }
-
   const detail = req.nextUrl.searchParams.get('detail') === 'true';
   if (detail && profileId) {
     const d = getMMDetail(profileId);
@@ -126,8 +90,7 @@ export async function GET(req: NextRequest) {
   }
 
   const states = getMMState(profileId);
-  const sniperStates = getSniperState();
-  return NextResponse.json({ states, sniperStates });
+  return NextResponse.json({ states });
 }
 
 export async function POST(req: NextRequest) {
@@ -165,30 +128,6 @@ export async function POST(req: NextRequest) {
 
     if (data.action === 'stop') {
       const state = await stopMM(data.profileId);
-      return NextResponse.json({ profileId: data.profileId, state });
-    }
-
-    if (data.action === 'start-sniper') {
-      const profile = await prisma.botProfile.findUnique({
-        where: { id: data.profileId },
-      });
-
-      if (!profile) {
-        return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
-      }
-      if (!profile.isActive) {
-        return NextResponse.json({ error: 'Profile is inactive' }, { status: 400 });
-      }
-      if (!profile.privateKey || !profile.apiKey) {
-        return NextResponse.json({ error: 'Profile missing credentials' }, { status: 400 });
-      }
-
-      const state = await startSniper(data.profileId, data.config);
-      return NextResponse.json({ profileId: data.profileId, state });
-    }
-
-    if (data.action === 'stop-sniper') {
-      const state = await stopSniper(data.profileId);
       return NextResponse.json({ profileId: data.profileId, state });
     }
 
