@@ -53,7 +53,7 @@ export interface TradeSkip {
   profileId: string;
   asset: string;
   conditionId: string;
-  reason: 'threshold' | 'price-too-high' | 'order-failed';
+  reason: 'threshold' | 'price-too-high' | 'price-too-low' | 'no-ask' | 'order-failed';
   secondsLeft: number;
   spotPrice: number;
   strikePrice: number;

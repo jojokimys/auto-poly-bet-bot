@@ -68,6 +68,49 @@ export async function getHistoricalPrice(
   return openPrice;
 }
 
+// ─── 5-min High-Low Range (volatility check) ────────────
+
+const rangeCache = new Map<string, { rangePct: number; timestamp: number }>();
+const RANGE_CACHE_TTL_MS = 10_000; // 10s cache — don't hammer Binance
+
+/**
+ * Returns (high - low) / low over the last 5 minutes as a fraction.
+ * Uses 5 x 1m klines. Returns null on error.
+ */
+export async function get5mRangePct(symbol: CryptoSymbol): Promise<number | null> {
+  const now = Date.now();
+  const cached = rangeCache.get(symbol);
+  if (cached && now - cached.timestamp < RANGE_CACHE_TTL_MS) {
+    return cached.rangePct;
+  }
+
+  try {
+    const res = await fetch(
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=5`,
+      { cache: 'no-store' },
+    );
+    if (!res.ok) return null;
+
+    const raw: any[][] = await res.json();
+    if (raw.length === 0) return null;
+
+    let high = -Infinity;
+    let low = Infinity;
+    for (const candle of raw) {
+      const h = parseFloat(candle[2]); // high
+      const l = parseFloat(candle[3]); // low
+      if (h > high) high = h;
+      if (l < low) low = l;
+    }
+
+    const rangePct = low > 0 ? (high - low) / low : 0;
+    rangeCache.set(symbol, { rangePct, timestamp: now });
+    return rangePct;
+  } catch {
+    return null;
+  }
+}
+
 export async function getCryptoPrice(symbol: CryptoSymbol): Promise<number> {
   const now = Date.now();
   const cached = cryptoCache.get(symbol);

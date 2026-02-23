@@ -54,7 +54,8 @@ export async function fetchBestBidAsk(tokenId: string): Promise<BestBidAsk | nul
     }
 
     return { bestBid, bestAsk, bidDepth, askDepth };
-  } catch {
+  } catch (err) {
+    console.warn(`[orderbook] fetchBestBidAsk failed for ${tokenId.slice(0, 12)}…:`, err instanceof Error ? err.message : err);
     return null;
   }
 }

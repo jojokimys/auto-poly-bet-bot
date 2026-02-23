@@ -37,8 +37,6 @@ export function SniperControl() {
     () => new Set(DEFAULT_SNIPER_CONFIG.selections.map(selKey))
   );
   const [maxPositionPct, setMaxPositionPct] = useState(DEFAULT_SNIPER_CONFIG.maxPositionPct * 100);
-  const [maxExposurePct, setMaxExposurePct] = useState(DEFAULT_SNIPER_CONFIG.maxExposurePct * 100);
-  const [minPriceDiffPct, setMinPriceDiffPct] = useState(DEFAULT_SNIPER_CONFIG.minPriceDiffPct * 100);
 
   const activeProfiles = profiles.filter((p) => p.isActive && p.hasPrivateKey && p.hasApiCredentials);
 
@@ -72,8 +70,6 @@ export function SniperControl() {
     startSniper(selectedProfileId, {
       selections,
       maxPositionPct: maxPositionPct / 100,
-      maxExposurePct: maxExposurePct / 100,
-      minPriceDiffPct: minPriceDiffPct / 100,
     });
   };
 
@@ -185,54 +181,6 @@ export function SniperControl() {
               />
             )}
           </div>
-
-          <div>
-            <p className="text-[11px] text-gray-500 mb-1.5">Max Exposure</p>
-            {isRunning ? (
-              <p className="text-sm font-mono font-semibold text-gray-900 dark:text-white">
-                {runningConfig ? (runningConfig.maxExposurePct * 100).toFixed(0) : '--'}%
-              </p>
-            ) : (
-              <Input
-                type="number"
-                size="sm"
-                variant="bordered"
-                min={10}
-                max={100}
-                step={5}
-                value={String(maxExposurePct)}
-                onValueChange={(v) => {
-                  const n = parseFloat(v);
-                  if (n >= 10 && n <= 100) setMaxExposurePct(n);
-                }}
-                endContent={<span className="text-[10px] text-gray-400">% of bal</span>}
-              />
-            )}
-          </div>
-
-          <div>
-            <p className="text-[11px] text-gray-500 mb-1.5">Min Price Diff</p>
-            {isRunning ? (
-              <p className="text-sm font-mono font-semibold text-gray-900 dark:text-white">
-                {runningConfig ? (runningConfig.minPriceDiffPct * 100).toFixed(2) : '--'}%
-              </p>
-            ) : (
-              <Input
-                type="number"
-                size="sm"
-                variant="bordered"
-                min={0.01}
-                max={10}
-                step={0.01}
-                value={String(minPriceDiffPct)}
-                onValueChange={(v) => {
-                  const n = parseFloat(v);
-                  if (n > 0 && n <= 10) setMinPriceDiffPct(n);
-                }}
-                endContent={<span className="text-[10px] text-gray-400">%</span>}
-              />
-            )}
-          </div>
         </div>
 
         <Divider />
@@ -266,11 +214,11 @@ export function SniperControl() {
           </div>
         </div>
 
-        {isRunning && (
+        {isRunning && runningConfig && (
           <div className="text-[11px] text-gray-500 space-y-1">
             <div className="flex justify-between">
               <span>Exposure</span>
-              <span className="font-mono">${selectedState?.totalExposure?.toFixed(2) ?? '0.00'} ({runningConfig ? (runningConfig.maxExposurePct * 100).toFixed(0) : '--'}% cap)</span>
+              <span className="font-mono">${selectedState?.totalExposure?.toFixed(2) ?? '0.00'}</span>
             </div>
             <div className="flex justify-between">
               <span>W / L</span>
@@ -278,12 +226,16 @@ export function SniperControl() {
             </div>
             <div className="flex justify-between">
               <span>Entry Window</span>
-              <span className="font-mono">{runningConfig?.minMinutesLeft ?? 0.5} - {runningConfig?.maxMinutesLeft ?? 3.0}m</span>
+              <span className="font-mono">{runningConfig.minMinutesLeft} - {runningConfig.maxMinutesLeft}m</span>
             </div>
-            <div className="flex justify-between">
-              <span>Max Token Price</span>
-              <span className="font-mono">{runningConfig?.maxTokenPrice ?? 0.93}</span>
-            </div>
+            <Divider className="my-1" />
+            <p className="text-[10px] text-gray-400 uppercase font-semibold">Per-Asset Thresholds</p>
+            {runningConfig.assetConfigs && Object.entries(runningConfig.assetConfigs).map(([asset, cfg]) => (
+              <div key={asset} className="flex justify-between">
+                <span className="font-mono">{asset}</span>
+                <span className="font-mono">diff≥{(cfg.minPriceDiffPct * 100).toFixed(2)}% / vol≤{((cfg.maxRangePct ?? 0) * 100).toFixed(1)}%</span>
+              </div>
+            ))}
           </div>
         )}
       </CardBody>

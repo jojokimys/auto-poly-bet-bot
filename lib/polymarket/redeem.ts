@@ -4,7 +4,7 @@ import { Contract } from '@ethersproject/contracts';
 import { JsonRpcProvider } from '@ethersproject/providers';
 import { Wallet } from '@ethersproject/wallet';
 import { BigNumber } from '@ethersproject/bignumber';
-import { createWalletClient, http, encodeFunctionData, type Hex } from 'viem';
+import { createWalletClient, createPublicClient, http, encodeFunctionData, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { RelayClient, RelayerTxType, type Transaction } from '@polymarket/builder-relayer-client';
@@ -12,6 +12,7 @@ import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { getBuilderConfig } from '@/lib/config/env';
 
 const POLYGON_RPC = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+const POLYGON_RPC2 = process.env.POLYGON_RPC_URL2 || POLYGON_RPC; // separate RPC for direct tx (claim)
 const RELAYER_URL = 'https://relayer-v2.polymarket.com';
 const CHAIN_ID = 137;
 
@@ -316,6 +317,117 @@ export async function redeemPositions(
 
     const success = result.state === 'STATE_CONFIRMED' || result.state === 'STATE_MINED';
     return { success, txHash: result.transactionHash || null, error: success ? null : `Relayer state: ${result.state}`, winningSide };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, txHash: null, error: msg, winningSide: null };
+  }
+}
+
+// ─── Polymarket Proxy Wallet Factory ABI ─────────────────
+// ProxyWallet clones are owned by the factory, not the EOA.
+// To execute tx: call factory.proxy() which derives your clone from msg.sender.
+
+const PROXY_WALLET_FACTORY = '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052';
+
+const PROXY_FACTORY_ABI = [{
+  name: 'proxy',
+  type: 'function',
+  stateMutability: 'payable',
+  inputs: [{
+    name: 'calls',
+    type: 'tuple[]',
+    components: [
+      { name: 'typeCode', type: 'uint8' },  // 1=CALL, 2=DELEGATECALL
+      { name: 'to', type: 'address' },
+      { name: 'value', type: 'uint256' },
+      { name: 'data', type: 'bytes' },
+    ],
+  }],
+  outputs: [{ name: 'returnValues', type: 'bytes[]' }],
+}] as const;
+
+/**
+ * Redeem via direct RPC transaction (no relayer, needs MATIC for gas).
+ * For POLY_PROXY wallets: calls ProxyWalletFactory.proxy() which forwards to clone.
+ * For EOA wallets: calls CTF/NR directly.
+ */
+export async function redeemPositionsRPC(
+  profile: RedeemProfile,
+  conditionId: string,
+  negRisk: boolean,
+  yesTokenId: string,
+  noTokenId: string,
+): Promise<OnChainRedeemResult> {
+  try {
+    const ownerAddress = profile.funderAddress || new Wallet(profile.privateKey).address;
+
+    // Read balances
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
+    const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
+      ctf.balanceOf(ownerAddress, yesTokenId),
+      ctf.balanceOf(ownerAddress, noTokenId),
+    ]);
+
+    if (yesBal.isZero() && noBal.isZero()) {
+      return { success: true, txHash: null, error: null, winningSide: null };
+    }
+
+    const winningSide = await getWinningSide(conditionId);
+
+    // Build inner calldata (the actual redeem call)
+    let innerTo: string;
+    let innerData: Hex;
+    if (negRisk) {
+      innerData = encodeFunctionData({
+        abi: NR_REDEEM_ABI,
+        functionName: 'redeemPositions',
+        args: [conditionId as Hex, [BigInt(yesBal.toString()), BigInt(noBal.toString())]],
+      });
+      innerTo = NEG_RISK_ADAPTER;
+    } else {
+      innerData = encodeFunctionData({
+        abi: CTF_REDEEM_ABI,
+        functionName: 'redeemPositions',
+        args: [USDC_E_ADDRESS as Hex, `0x${'00'.repeat(32)}` as Hex, conditionId as Hex, [1n, 2n]],
+      });
+      innerTo = CTF_ADDRESS;
+    }
+
+    const account = privateKeyToAccount(profile.privateKey as Hex);
+    const walletClient = createWalletClient({ account, chain: polygon, transport: http(POLYGON_RPC2) });
+    const publicClient = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC2) });
+
+    let txHash: Hex;
+    const isProxy = profile.funderAddress && profile.funderAddress.toLowerCase() !== account.address.toLowerCase();
+
+    if (isProxy) {
+      // Polymarket ProxyWallet: call factory.proxy() — factory derives clone from msg.sender
+      txHash = await walletClient.writeContract({
+        chain: polygon,
+        address: PROXY_WALLET_FACTORY as Hex,
+        abi: PROXY_FACTORY_ABI,
+        functionName: 'proxy',
+        args: [[{
+          typeCode: 1,  // CALL
+          to: innerTo as Hex,
+          value: 0n,
+          data: innerData,
+        }]],
+      });
+    } else {
+      // EOA: call CTF/NR directly
+      txHash = await walletClient.sendTransaction({
+        chain: polygon,
+        to: innerTo as Hex,
+        data: innerData,
+        value: 0n,
+      });
+    }
+
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+    const success = receipt.status === 'success';
+
+    return { success, txHash, error: success ? null : 'Transaction reverted', winningSide };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, txHash: null, error: msg, winningSide: null };

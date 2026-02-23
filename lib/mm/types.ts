@@ -132,17 +132,31 @@ export interface MarketSelection {
   mode: MarketMode;
 }
 
+/** Per-asset config tuned to each asset's volatility profile */
+export interface AssetSniperConfig {
+  minPriceDiffPct: number;  // base threshold (adaptive scales by time)
+  maxTokenPrice: number;    // max ask price to buy
+  maxRangePct: number;      // max 5m high-low range — skip if exceeded (whipsaw guard)
+}
+
+export const DEFAULT_ASSET_CONFIGS: Record<CryptoAsset, AssetSniperConfig> = {
+  BTC: { minPriceDiffPct: 0.0008, maxTokenPrice: 0.99, maxRangePct: 0.0022 },  // 0.22% (win p99=0.21%, catches 0.24% whipsaw loss)
+  ETH: { minPriceDiffPct: 0.0012, maxTokenPrice: 0.99, maxRangePct: 0.0035 },  // 0.35% (win max=0.31%, loss=0.39%)
+  XRP: { minPriceDiffPct: 0.0015, maxTokenPrice: 0.99, maxRangePct: 0.0030 },  // 0.30% (win p90=0.27%, loss=0.32%)
+  SOL: { minPriceDiffPct: 0.0018, maxTokenPrice: 0.99, maxRangePct: 0.0050 },  // 0.50% (win max=0.48%)
+};
+
 export interface SniperConfig {
   selections: MarketSelection[];
-  minMinutesLeft: number;      // 0.3 (earliest entry window)
-  maxMinutesLeft: number;      // 1.0 (latest entry window)
-  minPriceDiffPct: number;     // 0.0012 (0.12%)
-  maxTokenPrice: number;       // 0.95
-  maxPositionPct: number;      // 0.15 = 15% of balance per position
-  maxExposurePct: number;      // 0.80 = 80% of balance total exposure
-  maxConcurrentPositions: number; // 6
-  priceCheckIntervalMs: number;   // 1500
-  marketScanIntervalMs: number;   // 20000
+  assetConfigs: Record<CryptoAsset, AssetSniperConfig>;
+  minMinutesLeft: number;
+  maxMinutesLeft: number;
+  minTokenPrice: number;       // global floor (reject uncertain markets)
+  maxPositionPct: number;
+  maxExposurePct: number;
+  maxConcurrentPositions: number;
+  priceCheckIntervalMs: number;
+  marketScanIntervalMs: number;
 }
 
 export const ALL_MARKET_SELECTIONS: MarketSelection[] = [
@@ -167,14 +181,14 @@ export const DEFAULT_SNIPER_CONFIG: SniperConfig = {
     { asset: 'XRP', mode: '5m' },
     { asset: 'XRP', mode: '15m' },
   ],
-  minMinutesLeft: 0.3,       // 18s — enter even closer to expiry
-  maxMinutesLeft: 1.0,       // 60s — tight window, high certainty
-  minPriceDiffPct: 0.0012,   // 0.12% base (adaptive scaling adjusts per time)
-  maxTokenPrice: 0.95,       // accept up to 95¢ (3¢+ net profit/share after fees)
-  maxPositionPct: 0.15,      // 15% of balance per position
-  maxExposurePct: 0.80,      // 80% of balance total exposure
-  maxConcurrentPositions: 6, // 6 simultaneous positions
-  priceCheckIntervalMs: 1500, // 1.5s — faster reaction
+  assetConfigs: { ...DEFAULT_ASSET_CONFIGS },
+  minMinutesLeft: 0.2,        // 12s — enter even closer to expiry
+  maxMinutesLeft: 1.2,        // 72s — wider window for liquidity
+  minTokenPrice: 0.80,        // reject below 80¢ (uncertain market = coin flip)
+  maxPositionPct: 0.15,       // 15% of balance per position
+  maxExposurePct: 0.80,       // 80% of balance total exposure (unused, kept for config)
+  maxConcurrentPositions: 6,  // unused, kept for config
+  priceCheckIntervalMs: 1000, // 1s — fastest reaction
   marketScanIntervalMs: 20000, // 20s — find new markets faster
 };
 
