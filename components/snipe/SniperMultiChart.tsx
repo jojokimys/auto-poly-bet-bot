@@ -184,7 +184,11 @@ function MiniChart({ asset, height }: MiniChartProps) {
   useEffect(() => {
     if (!containerRef.current) return;
 
+    const initWidth = containerRef.current.clientWidth || containerRef.current.getBoundingClientRect().width;
+
     const chart = createChart(containerRef.current, {
+      width: initWidth,
+      height,
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
         textColor: isDark ? '#9ca3af' : '#6b7280',
@@ -203,6 +207,7 @@ function MiniChart({ asset, height }: MiniChartProps) {
         secondsVisible: false,
       },
       handleScale: { axisPressedMouseMove: { time: true, price: false } },
+      autoSize: false,
     });
 
     const series = chart.addSeries(CandlestickSeries, {
@@ -273,7 +278,7 @@ function MiniChart({ asset, height }: MiniChartProps) {
   const currentPrice = livePrice ?? (klinesRef.current.length > 0 ? klinesRef.current[klinesRef.current.length - 1]?.close : null);
 
   return (
-    <Card className="h-full">
+    <Card className="h-full overflow-hidden">
       <CardHeader className="py-2 flex flex-col gap-1">
         {/* Row 1: Asset + price */}
         <div className="flex justify-between items-center w-full">
@@ -374,7 +379,7 @@ function MiniChart({ asset, height }: MiniChartProps) {
           </div>
         )}
       </CardHeader>
-      <CardBody className="pt-0 pb-2">
+      <CardBody className="pt-0 pb-2 min-w-0 overflow-hidden">
         <div ref={containerRef} style={{ width: '100%', height }} />
       </CardBody>
     </Card>
