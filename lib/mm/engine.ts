@@ -17,10 +17,17 @@ import {
   mergePositions,
 } from '@/lib/polymarket/redeem';
 import { PolymarketWS } from './polymarket-ws';
+import { RtdsWS } from './rtds-ws';
 import { refreshVolatility } from './volatility';
-import { calculateQuotes } from './quoter';
+import { calculateQuotes, type FairValueInput } from './quoter';
 import { findActiveCryptoMarkets } from './market-finder';
-import type { MMState, MMConfig, ActiveMarket, BookSnapshot, VolatilityState, MarketMode } from './types';
+import { takerFeePerShare } from './fees';
+import {
+  analyzeMispricing,
+  realizedVolGarmanKlass,
+  type MispricingResult,
+} from './fair-value';
+import type { MMState, MMConfig, ActiveMarket, BookSnapshot, VolatilityState, MarketMode, CryptoAsset, Candle } from './types';
 import { DEFAULT_MM_CONFIG, MM_PRESETS } from './types';
 import type { BotLogEntry } from '@/lib/bot/types';
 
@@ -44,9 +51,12 @@ interface MMInstance {
   state: MMState;
   config: MMConfig;
   ws: PolymarketWS;
+  rtds: RtdsWS;
   activeMarkets: Map<string, ActiveMarket>; // conditionId → market
   assetToMarket: Map<string, string>; // assetId → conditionId
   pendingRedeems: Map<string, PendingRedeem>; // conditionId → pending redeem
+  fairValues: Map<string, MispricingResult>; // conditionId → fair value analysis
+  annualizedVol: Map<CryptoAsset, number>; // per-asset realized vol
   volatility: VolatilityState;
   marketFinderTimer: ReturnType<typeof setInterval> | null;
   volatilityTimer: ReturnType<typeof setInterval> | null;
@@ -54,6 +64,7 @@ interface MMInstance {
   circuitBreakerTimer: ReturnType<typeof setInterval> | null;
   fillCheckTimer: ReturnType<typeof setInterval> | null;
   redeemCheckTimer: ReturnType<typeof setInterval> | null;
+  volCalcTimer: ReturnType<typeof setInterval> | null;
   logBuffer: BotLogEntry[];
   spotPrices: Map<string, { price: number; time: number }>; // asset → last spot
   cooldownUntil: number;
@@ -171,7 +182,17 @@ async function placeQuotes(inst: MMInstance, market: ActiveMarket): Promise<void
   }
 
   const balance = await getCachedBalance(inst);
-  const quotes = calculateQuotes(market, volatility.regime, config, balance);
+
+  // Look up fair value for this market
+  let fairValueInput: FairValueInput | null = null;
+  if (config.enableFairValue) {
+    const fv = inst.fairValues.get(market.conditionId);
+    if (fv) {
+      fairValueInput = { fairYesPrice: fv.fairYesPrice, edge: fv.edge };
+    }
+  }
+
+  const quotes = calculateQuotes(market, volatility.regime, config, balance, 0.01, fairValueInput);
 
   if (!quotes) {
     if (market.bidOrderId || market.askOrderId) {
@@ -211,12 +232,14 @@ async function placeQuotes(inst: MMInstance, market: ActiveMarket): Promise<void
         side: 'BUY',
         price: bp,
         size: sz,
+        postOnly: true,
       }),
       placeProfileOrder(profile, {
         tokenId: market.noTokenId,
         side: 'BUY',
         price: ap,
         size: sz,
+        postOnly: true,
       }),
     ]);
 
@@ -226,7 +249,8 @@ async function placeQuotes(inst: MMInstance, market: ActiveMarket): Promise<void
     market.askPrice = ap;
     inst.state.quotesPlaced += 2;
 
-    log(inst, 'info', 'quote', `${market.cryptoAsset}: BUY YES @${bp} + BUY NO @${ap} × ${sz} (spread: ${((1 - bp - ap) * 100).toFixed(1)}c, regime: ${volatility.regime})`);
+    const fvTag = fairValueInput ? ` fv:${fairValueInput.fairYesPrice.toFixed(2)} edge:${(fairValueInput.edge * 100).toFixed(1)}c` : '';
+    log(inst, 'info', 'quote', `${market.cryptoAsset}: BUY YES @${bp} + BUY NO @${ap} × ${sz} (spread: ${((1 - bp - ap) * 100).toFixed(1)}c, regime: ${volatility.regime}${fvTag}) [postOnly]`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log(inst, 'error', 'quote', `Failed to place quotes for ${market.cryptoAsset}: ${msg}`);
@@ -435,6 +459,16 @@ async function sellPosition(inst: MMInstance, market: ActiveMarket, side: 'yes' 
     }
 
     const sellPrice = parseFloat(book.bestBid.toFixed(2));
+
+    // Fee-aware: skip sell if loss after taker fees > 10c/share (hold to expiry instead)
+    const fee = takerFeePerShare(sellPrice);
+    const netSellPrice = sellPrice - fee;
+    const lossPerShare = (entryPrice ?? 0) - netSellPrice;
+    if (lossPerShare > 0.10) {
+      log(inst, 'info', 'sell', `${market.cryptoAsset} ${side.toUpperCase()} sell would lose ${(lossPerShare * 100).toFixed(1)}c/share after fees — holding to expiry`);
+      return;
+    }
+
     await placeProfileOrder(inst.profile, {
       tokenId,
       side: 'SELL',
@@ -442,7 +476,7 @@ async function sellPosition(inst: MMInstance, market: ActiveMarket, side: 'yes' 
       size: held,
     });
 
-    const pnl = (sellPrice - (entryPrice ?? 0)) * held;
+    const pnl = (netSellPrice - (entryPrice ?? 0)) * held;
     inst.state.fillsSell++;
     inst.state.grossPnl += pnl;
 
@@ -599,7 +633,14 @@ async function checkCircuitBreaker(inst: MMInstance): Promise<void> {
     if (!symbol) continue;
 
     try {
-      const price = await getCryptoPrice(symbol);
+      // Prefer RTDS sync read (free, no API call), fallback to Binance REST
+      let price: number;
+      const rtdsPrice = inst.rtds.getSpotPrice(asset as CryptoAsset);
+      if (rtdsPrice !== null) {
+        price = rtdsPrice;
+      } else {
+        price = await getCryptoPrice(symbol);
+      }
       const prev = inst.spotPrices.get(asset);
 
       if (prev && prev.price > 0) {
@@ -624,6 +665,60 @@ async function checkCircuitBreaker(inst: MMInstance): Promise<void> {
       inst.spotPrices.set(asset, { price, time: now });
     } catch {
       // Ignore individual price fetch errors
+    }
+  }
+}
+
+// ─── RTDS Price Handler ──────────────────────────────────
+
+function handleRtdsPrice(inst: MMInstance, asset: CryptoAsset, spotPrice: number): void {
+  if (inst.state.status !== 'running') return;
+  if (!inst.config.enableFairValue) return;
+
+  inst.state.rtdsConnected = inst.rtds.isConnected();
+
+  // Update fair values for all active markets matching this asset
+  for (const [conditionId, market] of inst.activeMarkets) {
+    if (market.cryptoAsset !== asset) continue;
+    if (market.strikePrice === null || market.midpoint === null) continue;
+
+    const minutesLeft = Math.max(0, (market.endTime.getTime() - Date.now()) / 60_000);
+    if (minutesLeft <= 0) continue;
+
+    const sigma = inst.annualizedVol.get(asset) ?? 0.6; // fallback 60%
+    const result = analyzeMispricing(
+      spotPrice,
+      market.strikePrice,
+      sigma,
+      minutesLeft,
+      market.midpoint,
+      inst.config.minEdgeCents,
+    );
+
+    inst.fairValues.set(conditionId, result);
+  }
+}
+
+/** Calculate realized vol from kline data for each active asset */
+async function refreshVolEstimates(inst: MMInstance): Promise<void> {
+  const activeAssets = new Set<CryptoAsset>();
+  for (const market of inst.activeMarkets.values()) {
+    activeAssets.add(market.cryptoAsset as CryptoAsset);
+  }
+
+  for (const asset of activeAssets) {
+    try {
+      const symbol = `${asset}USDT`;
+      const { fetchKlines } = await import('@/lib/mm/volatility');
+      const candles: Candle[] = await fetchKlines(symbol, '1m', 60);
+      if (candles.length >= 10) {
+        const vol = realizedVolGarmanKlass(candles);
+        if (vol > 0 && Number.isFinite(vol)) {
+          inst.annualizedVol.set(asset, vol);
+        }
+      }
+    } catch {
+      // Keep previous estimate
     }
   }
 }
@@ -721,6 +816,7 @@ export async function startMM(profileId: string, configOverrides?: Partial<MMCon
   const volatility = await refreshVolatility(config.klineInterval);
 
   const ws = new PolymarketWS();
+  const rtds = new RtdsWS();
 
   const inst: MMInstance = {
     profileId,
@@ -737,13 +833,17 @@ export async function startMM(profileId: string, configOverrides?: Partial<MMCon
       roundTrips: 0,
       grossPnl: 0,
       totalExposure: 0,
+      rtdsConnected: false,
       error: null,
     },
     config,
     ws,
+    rtds,
     activeMarkets: new Map(),
     assetToMarket: new Map(),
     pendingRedeems: existing?.pendingRedeems ?? new Map(),
+    fairValues: new Map(),
+    annualizedVol: new Map(),
     volatility,
     marketFinderTimer: null,
     volatilityTimer: null,
@@ -751,6 +851,7 @@ export async function startMM(profileId: string, configOverrides?: Partial<MMCon
     circuitBreakerTimer: null,
     fillCheckTimer: null,
     redeemCheckTimer: null,
+    volCalcTimer: null,
     logBuffer: existing?.logBuffer ?? [],
     spotPrices: new Map(),
     cooldownUntil: 0,
@@ -766,6 +867,12 @@ export async function startMM(profileId: string, configOverrides?: Partial<MMCon
     (book) => handleBookUpdate(inst, book),
     () => handleWSDisconnect(inst),
   );
+
+  // Connect RTDS for real-time spot prices → fair value computation
+  if (config.enableFairValue) {
+    rtds.connect((asset, price) => handleRtdsPrice(inst, asset, price));
+    log(inst, 'info', 'rtds', 'RTDS WebSocket connecting for real-time spot prices');
+  }
 
   await refreshMarkets(inst);
 
@@ -789,9 +896,15 @@ export async function startMM(profileId: string, configOverrides?: Partial<MMCon
     }
   }, fast ? 30_000 : 60_000);
   inst.expiryCheckTimer = setInterval(() => checkExpiries(inst), fast ? 5_000 : 10_000);
-  inst.circuitBreakerTimer = setInterval(() => checkCircuitBreaker(inst), 5_000);
+  inst.circuitBreakerTimer = setInterval(() => checkCircuitBreaker(inst), config.enableFairValue ? 2_000 : 5_000);
   inst.fillCheckTimer = setInterval(() => checkFills(inst), fast ? 3_000 : 5_000);
   inst.redeemCheckTimer = setInterval(() => checkPendingRedeems(inst), 60_000);
+
+  // Volatility estimation for fair value (every 60s)
+  if (config.enableFairValue) {
+    refreshVolEstimates(inst).catch(() => {}); // initial estimate
+    inst.volCalcTimer = setInterval(() => refreshVolEstimates(inst), 60_000);
+  }
 
   return { ...inst.state };
 }
@@ -810,6 +923,7 @@ export async function stopMM(profileId: string): Promise<MMState> {
       roundTrips: 0,
       grossPnl: 0,
       totalExposure: 0,
+      rtdsConnected: false,
       error: null,
     };
   }
@@ -823,6 +937,10 @@ export async function stopMM(profileId: string): Promise<MMState> {
   if (inst.circuitBreakerTimer) clearInterval(inst.circuitBreakerTimer);
   if (inst.fillCheckTimer) clearInterval(inst.fillCheckTimer);
   if (inst.redeemCheckTimer) clearInterval(inst.redeemCheckTimer);
+  if (inst.volCalcTimer) clearInterval(inst.volCalcTimer);
+
+  // Disconnect RTDS
+  inst.rtds.disconnect();
 
   // Cancel all orders
   try {
@@ -843,7 +961,7 @@ export function getMMState(profileId?: string): MMState | Record<string, MMState
       return {
         status: 'stopped', startedAt: null, volatilityRegime: 'volatile',
         activeMarkets: 0, quotesPlaced: 0, fillsBuy: 0, fillsSell: 0,
-        roundTrips: 0, grossPnl: 0, totalExposure: 0, error: null,
+        roundTrips: 0, grossPnl: 0, totalExposure: 0, rtdsConnected: false, error: null,
       };
     }
     return { ...inst.state };
@@ -861,21 +979,30 @@ export function getMMDetail(profileId: string) {
   if (!inst) return null;
 
   const now = Date.now();
-  const markets = [...inst.activeMarkets.values()].map((m) => ({
-    conditionId: m.conditionId,
-    question: m.question,
-    cryptoAsset: m.cryptoAsset,
-    endTime: m.endTime.toISOString(),
-    bestBid: m.bestBid,
-    bestAsk: m.bestAsk,
-    midpoint: m.midpoint,
-    bidPrice: m.bidPrice,
-    askPrice: m.askPrice,
-    yesHeld: m.yesHeld,
-    noHeld: m.noHeld,
-    minutesLeft: Math.max(0, (m.endTime.getTime() - now) / 60_000),
-    strikePrice: m.strikePrice,
-  }));
+  const markets = [...inst.activeMarkets.values()].map((m) => {
+    const fv = inst.fairValues.get(m.conditionId);
+    return {
+      conditionId: m.conditionId,
+      question: m.question,
+      cryptoAsset: m.cryptoAsset,
+      endTime: m.endTime.toISOString(),
+      bestBid: m.bestBid,
+      bestAsk: m.bestAsk,
+      midpoint: m.midpoint,
+      bidPrice: m.bidPrice,
+      askPrice: m.askPrice,
+      yesHeld: m.yesHeld,
+      noHeld: m.noHeld,
+      minutesLeft: Math.max(0, (m.endTime.getTime() - now) / 60_000),
+      strikePrice: m.strikePrice,
+      // Fair value fields
+      fairYesPrice: fv?.fairYesPrice ?? null,
+      edge: fv ? Math.round(fv.edge * 10000) / 10000 : null, // 4 decimal places
+      signal: fv?.signal ?? null,
+      confidence: fv?.confidence ?? null,
+      spotPrice: m.cryptoAsset ? (inst.rtds.getSpotPrice(m.cryptoAsset as CryptoAsset) ?? null) : null,
+    };
+  });
 
   return {
     state: { ...inst.state },

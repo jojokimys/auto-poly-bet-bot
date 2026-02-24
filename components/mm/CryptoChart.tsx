@@ -95,7 +95,11 @@ export function CryptoChart() {
   useEffect(() => {
     if (!containerRef.current) return;
 
+    const initWidth = containerRef.current.clientWidth || containerRef.current.getBoundingClientRect().width;
+
     const chart = createChart(containerRef.current, {
+      width: initWidth,
+      height: 300,
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
         textColor: isDark ? '#9ca3af' : '#6b7280',
@@ -116,6 +120,7 @@ export function CryptoChart() {
         secondsVisible: false,
       },
       handleScale: { axisPressedMouseMove: { time: true, price: false } },
+      autoSize: false,
     });
 
     const series = chart.addSeries(CandlestickSeries, {
@@ -210,7 +215,7 @@ export function CryptoChart() {
   }, [strikePrices, klines, selectedAsset]);
 
   return (
-    <Card className="h-full">
+    <Card className="h-full overflow-hidden">
       <CardHeader className="flex justify-between items-center">
         <div className="flex items-center gap-2">
           <h3 className="text-sm font-semibold">{selectedAsset}/USDT</h3>
@@ -239,7 +244,7 @@ export function CryptoChart() {
           </Chip>
         </div>
       </CardHeader>
-      <CardBody className="pt-0">
+      <CardBody className="pt-0 min-w-0 overflow-hidden">
         <div ref={containerRef} className="w-full h-[300px]" />
 
         {/* Active quotes bar */}

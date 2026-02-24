@@ -21,6 +21,8 @@ export interface MMConfig {
   minMinutes: number;
   maxMinutes: number;
   klineInterval: string;
+  enableFairValue: boolean;
+  minEdgeCents: number;
 }
 
 export const MM_PRESETS: Record<MarketMode, MMConfig> = {
@@ -37,6 +39,8 @@ export const MM_PRESETS: Record<MarketMode, MMConfig> = {
     minMinutes: 1.5,
     maxMinutes: 5,
     klineInterval: '5m',
+    enableFairValue: true,
+    minEdgeCents: 0.5,
   },
   '15m': {
     mode: '15m',
@@ -51,6 +55,8 @@ export const MM_PRESETS: Record<MarketMode, MMConfig> = {
     minMinutes: 3,
     maxMinutes: 14,
     klineInterval: '15m',
+    enableFairValue: true,
+    minEdgeCents: 0.5,
   },
 };
 
@@ -67,6 +73,7 @@ export interface MMState {
   roundTrips: number;
   grossPnl: number;
   totalExposure: number;
+  rtdsConnected: boolean;
   error: string | null;
 }
 

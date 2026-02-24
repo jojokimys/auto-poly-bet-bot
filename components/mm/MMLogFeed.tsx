@@ -55,7 +55,7 @@ export function MMLogFeed() {
               [...logs].reverse().map((entry) => (
                 <div
                   key={entry.id}
-                  className="flex items-start gap-2 text-xs py-1 border-b border-gray-100 dark:border-gray-800 last:border-0"
+                  className="flex items-start gap-2 text-xs py-1 border-b border-gray-100 dark:border-gray-800 last:border-0 min-w-0"
                 >
                   <span className="text-gray-400 shrink-0 w-16 font-mono">
                     {formatTime(entry.createdAt)}

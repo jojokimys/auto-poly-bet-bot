@@ -84,13 +84,13 @@ export function MMControl() {
         )}
       </CardHeader>
       <CardBody className="pt-0 space-y-4">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 min-w-0">
           <Select
             size="sm"
             variant="bordered"
             aria-label="Select profile"
             placeholder="Select profile"
-            className="flex-1"
+            className="flex-1 min-w-0"
             selectedKeys={selectedProfileId ? [selectedProfileId] : []}
             onSelectionChange={(keys) => {
               const id = Array.from(keys)[0] as string;

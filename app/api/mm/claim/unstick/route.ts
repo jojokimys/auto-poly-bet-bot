@@ -3,8 +3,7 @@ import { createWalletClient, createPublicClient, http, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { loadProfile } from '@/lib/bot/profile-client';
-
-const POLYGON_RPC2 = process.env.POLYGON_RPC_URL2 || process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+import { TX_RPCS } from '@/lib/polygon/rpc';
 
 /**
  * GET: Check nonce status (confirmed vs pending)
@@ -19,24 +18,28 @@ export async function GET(req: NextRequest) {
   if (!profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
 
   const account = privateKeyToAccount(profile.privateKey as Hex);
-  const publicClient = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC2) });
 
-  const [confirmed, pending, gasPrice] = await Promise.all([
-    publicClient.getTransactionCount({ address: account.address, blockTag: 'latest' }),
-    publicClient.getTransactionCount({ address: account.address, blockTag: 'pending' }),
-    publicClient.getGasPrice(),
-  ]);
-
-  const stuckCount = pending - confirmed;
-
-  return NextResponse.json({
-    rpcUrl: POLYGON_RPC2.replace(/\/[a-f0-9]{20,}$/i, '/***'), // mask API key
-    address: account.address,
-    confirmedNonce: confirmed,
-    pendingNonce: pending,
-    stuckCount,
-    currentGasGwei: Number(gasPrice) / 1e9,
-  });
+  for (const rpcUrl of TX_RPCS) {
+    try {
+      const publicClient = createPublicClient({ chain: polygon, transport: http(rpcUrl) });
+      const [confirmed, pending, gasPrice] = await Promise.all([
+        publicClient.getTransactionCount({ address: account.address, blockTag: 'latest' }),
+        publicClient.getTransactionCount({ address: account.address, blockTag: 'pending' }),
+        publicClient.getGasPrice(),
+      ]);
+      return NextResponse.json({
+        rpcUrl: rpcUrl.replace(/\/[a-f0-9]{20,}$/i, '/***'),
+        address: account.address,
+        confirmedNonce: confirmed,
+        pendingNonce: pending,
+        stuckCount: pending - confirmed,
+        currentGasGwei: Number(gasPrice) / 1e9,
+      });
+    } catch {
+      continue;
+    }
+  }
+  return NextResponse.json({ error: 'All RPCs failed' }, { status: 502 });
 }
 
 export async function POST(req: NextRequest) {
@@ -49,9 +52,11 @@ export async function POST(req: NextRequest) {
   if (!profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
 
   const account = privateKeyToAccount(profile.privateKey as Hex);
-  const walletClient = createWalletClient({ account, chain: polygon, transport: http(POLYGON_RPC2) });
-  const publicClient = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC2) });
+  const gasPrice = BigInt(Math.round(gasPriceGwei * 1e9));
+  const results: { nonce: number; txHash: string | null; error: string | null }[] = [];
+  let rpcIdx = 0;
 
+  const publicClient = createPublicClient({ chain: polygon, transport: http(TX_RPCS[0]) });
   const confirmed = await publicClient.getTransactionCount({ address: account.address, blockTag: 'latest' });
   const pending = await publicClient.getTransactionCount({ address: account.address, blockTag: 'pending' });
   const stuckCount = pending - confirmed;
@@ -60,30 +65,30 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ message: 'No stuck transactions', confirmed, pending });
   }
 
-  const gasPrice = BigInt(Math.round(gasPriceGwei * 1e9));
-  const results: { nonce: number; txHash: string | null; error: string | null }[] = [];
-
-  // Send replacement self-transfers for each stuck nonce
   for (let nonce = confirmed; nonce < pending; nonce++) {
+    const rpcUrl = TX_RPCS[rpcIdx];
+    const walletClient = createWalletClient({ account, chain: polygon, transport: http(rpcUrl) });
     try {
       const txHash = await walletClient.sendTransaction({
         chain: polygon,
-        to: account.address, // self-transfer
+        to: account.address,
         value: 0n,
         nonce,
         gasPrice,
-        gas: 21000n, // simple transfer
+        gas: 21000n,
       });
       results.push({ nonce, txHash, error: null });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      results.push({ nonce, txHash: null, error: msg });
-      // If one nonce fails, subsequent ones will also fail
-      if (msg.includes('nonce too low')) continue; // already confirmed, skip
-      if (msg.includes('replacement transaction underpriced')) {
-        // Need higher gas — stop and report
-        break;
+      const isRateLimit = msg.includes('429') || msg.includes('Too Many') || msg.includes('rate limit');
+      if (isRateLimit && rpcIdx < TX_RPCS.length - 1) {
+        rpcIdx++;
+        nonce--;
+        continue;
       }
+      results.push({ nonce, txHash: null, error: msg });
+      if (msg.includes('nonce too low')) continue;
+      if (msg.includes('replacement transaction underpriced')) break;
     }
   }
 
@@ -92,6 +97,7 @@ export async function POST(req: NextRequest) {
     gasPriceGwei,
     startNonce: confirmed,
     endNonce: pending - 1,
+    rpcUsed: TX_RPCS[rpcIdx]?.replace(/\/[a-f0-9]{20,}$/i, '/***'),
     results,
     sent: results.filter(r => r.txHash).length,
     failed: results.filter(r => r.error).length,
