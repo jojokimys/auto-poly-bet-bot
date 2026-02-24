@@ -1,7 +1,6 @@
 import 'server-only';
 
 import { Contract } from '@ethersproject/contracts';
-import { JsonRpcProvider } from '@ethersproject/providers';
 import { Wallet } from '@ethersproject/wallet';
 import { BigNumber } from '@ethersproject/bignumber';
 import { createWalletClient, createPublicClient, http, encodeFunctionData, type Hex } from 'viem';
@@ -10,11 +9,20 @@ import { polygon } from 'viem/chains';
 import { RelayClient, RelayerTxType, type Transaction } from '@polymarket/builder-relayer-client';
 import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { getBuilderConfig } from '@/lib/config/env';
+import {
+  POLYGON_RPCS,
+  TX_RPCS,
+  CHAIN_ID,
+  getTxRpcUrl,
+  switchToNextRpc,
+  isRetryableRpcError,
+  withProviderFallback,
+  getCachedGasPrice,
+  PROXY_REDEEM_GAS,
+  EOA_REDEEM_GAS,
+} from '@/lib/polygon/rpc';
 
-const POLYGON_RPC = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
-const POLYGON_RPC2 = process.env.POLYGON_RPC_URL2 || POLYGON_RPC; // separate RPC for direct tx (claim)
 const RELAYER_URL = 'https://relayer-v2.polymarket.com';
-const CHAIN_ID = 137;
 
 // Polymarket contract addresses (Polygon mainnet)
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
@@ -86,19 +94,15 @@ const DATA_API_URL = 'https://data-api.polymarket.com';
 
 export interface ClaimablePosition {
   conditionId: string;
-  asset: string;          // tokenId we hold (winning side)
-  oppositeAsset: string;  // other side tokenId
-  outcomeIndex: number;   // 0=Yes, 1=No
+  asset: string;
+  oppositeAsset: string;
+  outcomeIndex: number;
   negativeRisk: boolean;
   size: number;
   title: string;
-  outcome: string;        // "Yes" or "No"
+  outcome: string;
 }
 
-/**
- * Fetch all redeemable positions for a wallet in a single API call.
- * Uses Polymarket Data API — no auth needed, just wallet address.
- */
 export async function fetchClaimablePositions(walletAddress: string): Promise<ClaimablePosition[]> {
   try {
     const res = await fetch(
@@ -133,11 +137,10 @@ export interface OnChainRedeemResult {
   winningSide: 'YES' | 'NO' | null;
 }
 
-/** Profile info needed for relayer transactions */
 export interface RedeemProfile {
   privateKey: string;
   funderAddress: string;
-  signatureType?: number; // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
+  signatureType?: number;
   apiKey: string;
   apiSecret: string;
   apiPassphrase: string;
@@ -146,43 +149,16 @@ export interface RedeemProfile {
   builderApiPassphrase?: string;
 }
 
-// ─── RPC Provider (read-only) ───────────────────────────
-
-let providerCache: JsonRpcProvider | null = null;
-
-class FetchJsonRpcProvider extends JsonRpcProvider {
-  async send(method: string, params: Array<any>): Promise<any> {
-    const request = { method, params, id: 42, jsonrpc: '2.0' };
-    const res = await fetch(this.connection.url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-    });
-    const json = await res.json();
-    if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
-    return json.result;
-  }
-}
-
-function getProvider(forceNew = false): JsonRpcProvider {
-  if (!providerCache || forceNew) {
-    providerCache = new FetchJsonRpcProvider(POLYGON_RPC, CHAIN_ID);
-  }
-  return providerCache;
-}
-
 // ─── Relayer Client ─────────────────────────────────────
 
 function createRelayClient(profile: RedeemProfile): RelayClient {
-  // Use viem WalletClient — the builder-abstract-signer expects ethers v6 or viem
   const account = privateKeyToAccount(profile.privateKey as Hex);
   const wallet = createWalletClient({
     account,
     chain: polygon,
-    transport: http(POLYGON_RPC),
+    transport: http(POLYGON_RPCS[0]),
   });
 
-  // Builder config: builder creds → CLOB API creds fallback → env fallback
   const bKey = profile.builderApiKey || profile.apiKey;
   const bSecret = profile.builderApiSecret || profile.apiSecret;
   const bPass = profile.builderApiPassphrase || profile.apiPassphrase;
@@ -196,7 +172,6 @@ function createRelayClient(profile: RedeemProfile): RelayClient {
     builderConfig = getBuilderConfig();
   }
 
-  // Map signatureType to relayer tx type
   const relayTxType = profile.signatureType === 2
     ? RelayerTxType.SAFE
     : RelayerTxType.PROXY;
@@ -206,36 +181,18 @@ function createRelayClient(profile: RedeemProfile): RelayClient {
 
 // ─── Read-only RPC helpers ──────────────────────────────
 
-/** Check if a condition has been resolved on-chain */
 export async function isConditionResolved(conditionId: string): Promise<boolean> {
-  try {
-    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
+  return withProviderFallback(async (provider) => {
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
     const denom: BigNumber = await ctf.payoutDenominator(conditionId);
     return denom.gt(0);
-  } catch {
-    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider(true));
-    const denom: BigNumber = await ctf.payoutDenominator(conditionId);
-    return denom.gt(0);
-  }
+  });
 }
 
 export async function getWinningSide(conditionId: string): Promise<'YES' | 'NO' | null> {
   try {
-    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
-    const denom: BigNumber = await ctf.payoutDenominator(conditionId);
-    if (denom.isZero()) return null;
-
-    const [yesNum, noNum]: [BigNumber, BigNumber] = await Promise.all([
-      ctf.payoutNumerators(conditionId, 0),
-      ctf.payoutNumerators(conditionId, 1),
-    ]);
-
-    if (yesNum.gt(0) && noNum.isZero()) return 'YES';
-    if (noNum.gt(0) && yesNum.isZero()) return 'NO';
-    return null;
-  } catch {
-    try {
-      const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider(true));
+    return await withProviderFallback(async (provider) => {
+      const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
       const denom: BigNumber = await ctf.payoutDenominator(conditionId);
       if (denom.isZero()) return null;
 
@@ -247,24 +204,55 @@ export async function getWinningSide(conditionId: string): Promise<'YES' | 'NO' 
       if (yesNum.gt(0) && noNum.isZero()) return 'YES';
       if (noNum.gt(0) && yesNum.isZero()) return 'NO';
       return null;
-    } catch {
-      return null;
-    }
+    });
+  } catch {
+    return null;
   }
 }
 
-/** Get ERC-1155 token balance on the CTF contract */
 export async function getTokenBalance(owner: string, tokenId: string): Promise<BigNumber> {
-  const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
-  return ctf.balanceOf(owner, tokenId);
+  return withProviderFallback(async (provider) => {
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
+    return ctf.balanceOf(owner, tokenId);
+  });
 }
+
+// ─── Helper: read balances with fallback ─────────────────
+
+async function readBalances(ownerAddress: string, yesTokenId: string, noTokenId: string) {
+  return withProviderFallback(async (provider) => {
+    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, provider);
+    const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
+      ctf.balanceOf(ownerAddress, yesTokenId),
+      ctf.balanceOf(ownerAddress, noTokenId),
+    ]);
+    return { yesBal, noBal };
+  });
+}
+
+// ─── Polymarket Proxy Wallet Factory ABI ─────────────────
+
+const PROXY_WALLET_FACTORY = '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052';
+
+const PROXY_FACTORY_ABI = [{
+  name: 'proxy',
+  type: 'function',
+  stateMutability: 'payable',
+  inputs: [{
+    name: 'calls',
+    type: 'tuple[]',
+    components: [
+      { name: 'typeCode', type: 'uint8' },
+      { name: 'to', type: 'address' },
+      { name: 'value', type: 'uint256' },
+      { name: 'data', type: 'bytes' },
+    ],
+  }],
+  outputs: [{ name: 'returnValues', type: 'bytes[]' }],
+}] as const;
 
 // ─── Relayer-based Redeem & Merge ───────────────────────
 
-/**
- * Redeem resolved positions via Polymarket relayer.
- * No direct RPC write needed — relayer handles gas & submission.
- */
 export async function redeemPositions(
   profile: RedeemProfile,
   conditionId: string,
@@ -274,13 +262,7 @@ export async function redeemPositions(
 ): Promise<OnChainRedeemResult> {
   try {
     const ownerAddress = profile.funderAddress || new Wallet(profile.privateKey).address;
-
-    // Read balances (RPC)
-    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
-    const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
-      ctf.balanceOf(ownerAddress, yesTokenId),
-      ctf.balanceOf(ownerAddress, noTokenId),
-    ]);
+    const { yesBal, noBal } = await readBalances(ownerAddress, yesTokenId, noTokenId);
 
     if (yesBal.isZero() && noBal.isZero()) {
       return { success: true, txHash: null, error: null, winningSide: null };
@@ -288,7 +270,6 @@ export async function redeemPositions(
 
     const winningSide = await getWinningSide(conditionId);
 
-    // Build calldata
     let tx: Transaction;
     if (negRisk) {
       const data = encodeFunctionData({
@@ -306,7 +287,6 @@ export async function redeemPositions(
       tx = { to: CTF_ADDRESS, data, value: '0' };
     }
 
-    // Submit via relayer
     const relay = createRelayClient(profile);
     const response = await relay.execute([tx], 'redeem positions');
     const result = await response.wait();
@@ -323,34 +303,8 @@ export async function redeemPositions(
   }
 }
 
-// ─── Polymarket Proxy Wallet Factory ABI ─────────────────
-// ProxyWallet clones are owned by the factory, not the EOA.
-// To execute tx: call factory.proxy() which derives your clone from msg.sender.
+// ─── Direct RPC Redeem ───────────────────────────────────
 
-const PROXY_WALLET_FACTORY = '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052';
-
-const PROXY_FACTORY_ABI = [{
-  name: 'proxy',
-  type: 'function',
-  stateMutability: 'payable',
-  inputs: [{
-    name: 'calls',
-    type: 'tuple[]',
-    components: [
-      { name: 'typeCode', type: 'uint8' },  // 1=CALL, 2=DELEGATECALL
-      { name: 'to', type: 'address' },
-      { name: 'value', type: 'uint256' },
-      { name: 'data', type: 'bytes' },
-    ],
-  }],
-  outputs: [{ name: 'returnValues', type: 'bytes[]' }],
-}] as const;
-
-/**
- * Redeem via direct RPC transaction (no relayer, needs MATIC for gas).
- * For POLY_PROXY wallets: calls ProxyWalletFactory.proxy() which forwards to clone.
- * For EOA wallets: calls CTF/NR directly.
- */
 export async function redeemPositionsRPC(
   profile: RedeemProfile,
   conditionId: string,
@@ -360,13 +314,7 @@ export async function redeemPositionsRPC(
 ): Promise<OnChainRedeemResult> {
   try {
     const ownerAddress = profile.funderAddress || new Wallet(profile.privateKey).address;
-
-    // Read balances
-    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
-    const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
-      ctf.balanceOf(ownerAddress, yesTokenId),
-      ctf.balanceOf(ownerAddress, noTokenId),
-    ]);
+    const { yesBal, noBal } = await readBalances(ownerAddress, yesTokenId, noTokenId);
 
     if (yesBal.isZero() && noBal.isZero()) {
       return { success: true, txHash: null, error: null, winningSide: null };
@@ -374,7 +322,6 @@ export async function redeemPositionsRPC(
 
     const winningSide = await getWinningSide(conditionId);
 
-    // Build inner calldata (the actual redeem call)
     let innerTo: string;
     let innerData: Hex;
     if (negRisk) {
@@ -394,50 +341,67 @@ export async function redeemPositionsRPC(
     }
 
     const account = privateKeyToAccount(profile.privateKey as Hex);
-    const walletClient = createWalletClient({ account, chain: polygon, transport: http(POLYGON_RPC2) });
-    const publicClient = createPublicClient({ chain: polygon, transport: http(POLYGON_RPC2) });
-
-    let txHash: Hex;
     const isProxy = profile.funderAddress && profile.funderAddress.toLowerCase() !== account.address.toLowerCase();
 
-    if (isProxy) {
-      // Polymarket ProxyWallet: call factory.proxy() — factory derives clone from msg.sender
-      txHash = await walletClient.writeContract({
-        chain: polygon,
-        address: PROXY_WALLET_FACTORY as Hex,
-        abi: PROXY_FACTORY_ABI,
-        functionName: 'proxy',
-        args: [[{
-          typeCode: 1,  // CALL
-          to: innerTo as Hex,
-          value: 0n,
-          data: innerData,
-        }]],
-      });
-    } else {
-      // EOA: call CTF/NR directly
-      txHash = await walletClient.sendTransaction({
-        chain: polygon,
-        to: innerTo as Hex,
-        data: innerData,
-        value: 0n,
-      });
+    let lastError: string | null = null;
+    for (let attempt = 0; attempt < TX_RPCS.length; attempt++) {
+      const rpcUrl = getTxRpcUrl();
+      const walletClient = createWalletClient({ account, chain: polygon, transport: http(rpcUrl) });
+      const publicClient = createPublicClient({ chain: polygon, transport: http(rpcUrl) });
+
+      try {
+        const gasPrice = await getCachedGasPrice(publicClient);
+
+        let txHash: Hex;
+        if (isProxy) {
+          txHash = await walletClient.writeContract({
+            chain: polygon,
+            address: PROXY_WALLET_FACTORY as Hex,
+            abi: PROXY_FACTORY_ABI,
+            functionName: 'proxy',
+            args: [[{
+              typeCode: 1,
+              to: innerTo as Hex,
+              value: 0n,
+              data: innerData,
+            }]],
+            gas: PROXY_REDEEM_GAS,
+            gasPrice,
+          });
+        } else {
+          txHash = await walletClient.sendTransaction({
+            chain: polygon,
+            to: innerTo as Hex,
+            data: innerData,
+            value: 0n,
+            gas: EOA_REDEEM_GAS,
+            gasPrice,
+          });
+        }
+
+        const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+        const success = receipt.status === 'success';
+        return { success, txHash, error: success ? null : 'Transaction reverted', winningSide };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isRetryableRpcError(msg) && attempt < TX_RPCS.length - 1) {
+          switchToNextRpc();
+          lastError = msg;
+          continue;
+        }
+        return { success: false, txHash: null, error: msg, winningSide };
+      }
     }
 
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
-    const success = receipt.status === 'success';
-
-    return { success, txHash, error: success ? null : 'Transaction reverted', winningSide };
+    return { success: false, txHash: null, error: lastError ?? 'All RPCs failed', winningSide };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, txHash: null, error: msg, winningSide: null };
   }
 }
 
-/**
- * Merge equal YES + NO positions back into USDC via relayer.
- * Used for MM round trips to recover capital immediately.
- */
+// ─── Relayer-based Merge ─────────────────────────────────
+
 export async function mergePositions(
   profile: RedeemProfile,
   conditionId: string,
@@ -447,20 +411,13 @@ export async function mergePositions(
 ): Promise<OnChainRedeemResult> {
   try {
     const ownerAddress = profile.funderAddress || new Wallet(profile.privateKey).address;
-
-    // Read balances (RPC)
-    const ctf = new Contract(CTF_ADDRESS, CTF_ABI, getProvider());
-    const [yesBal, noBal]: [BigNumber, BigNumber] = await Promise.all([
-      ctf.balanceOf(ownerAddress, yesTokenId),
-      ctf.balanceOf(ownerAddress, noTokenId),
-    ]);
+    const { yesBal, noBal } = await readBalances(ownerAddress, yesTokenId, noTokenId);
 
     const mergeAmount = yesBal.lt(noBal) ? yesBal : noBal;
     if (mergeAmount.isZero()) {
       return { success: true, txHash: null, error: null, winningSide: null };
     }
 
-    // Build calldata
     let tx: Transaction;
     if (negRisk) {
       const data = encodeFunctionData({
@@ -484,7 +441,6 @@ export async function mergePositions(
       tx = { to: CTF_ADDRESS, data, value: '0' };
     }
 
-    // Submit via relayer
     const relay = createRelayClient(profile);
     const response = await relay.execute([tx], 'merge positions');
     const result = await response.wait();

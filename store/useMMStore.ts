@@ -16,6 +16,11 @@ interface MMMarketDetail {
   noHeld: number;
   minutesLeft: number;
   strikePrice: number | null;
+  fairYesPrice: number | null;
+  edge: number | null;
+  signal: string | null;
+  confidence: number | null;
+  spotPrice: number | null;
 }
 
 interface MMDetail {
@@ -171,35 +176,43 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
 
   poll: async () => {
     try {
-      const stateRes = await fetch('/api/mm');
+      const [stateRes, sniperStateRes] = await Promise.all([
+        fetch('/api/mm'),
+        fetch('/api/sniper'),
+      ]);
       if (stateRes.ok) {
         const data = await stateRes.json();
-        set({ states: data.states ?? {}, sniperStates: data.sniperStates ?? {} });
+        set({ states: data.states ?? {} });
+      }
+      if (sniperStateRes.ok) {
+        const data = await sniperStateRes.json();
+        set({ sniperStates: data.states ?? {} });
       }
 
       const { selectedProfileId } = get();
       if (selectedProfileId) {
-        const detailRes = await fetch(`/api/mm?detail=true&profileId=${selectedProfileId}`);
+        const [detailRes, sniperDetailRes, sniperLogRes, logRes] = await Promise.all([
+          fetch(`/api/mm?detail=true&profileId=${selectedProfileId}`),
+          fetch(`/api/sniper?detail=true&profileId=${selectedProfileId}`),
+          fetch(`/api/sniper?logs=true&profileId=${selectedProfileId}&limit=50`),
+          fetch(`/api/mm?logs=true&profileId=${selectedProfileId}&limit=50`),
+        ]);
+
         if (detailRes.ok) {
           const data = await detailRes.json();
           set({ detail: data.detail ?? null });
         }
 
-        // Sniper detail
-        const sniperDetailRes = await fetch(`/api/mm?sniperDetail=true&profileId=${selectedProfileId}`);
         if (sniperDetailRes.ok) {
           const data = await sniperDetailRes.json();
-          set({ sniperDetail: data.sniperDetail ?? null });
+          set({ sniperDetail: data.detail ?? null });
         }
 
-        // Sniper logs
-        const sniperLogRes = await fetch(`/api/mm?logs=true&sniper=true&profileId=${selectedProfileId}&limit=50`);
         if (sniperLogRes.ok) {
           const data = await sniperLogRes.json();
           set({ sniperLogs: data.logs ?? [] });
         }
 
-        const logRes = await fetch(`/api/mm?logs=true&profileId=${selectedProfileId}&limit=50`);
         if (logRes.ok) {
           const data = await logRes.json();
           const logs: BotLogEntry[] = data.logs ?? [];
@@ -301,10 +314,10 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
   startSniper: async (profileId, config) => {
     set({ loading: true, error: null });
     try {
-      const res = await fetch('/api/mm', {
+      const res = await fetch('/api/sniper', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'start-sniper', profileId, config }),
+        body: JSON.stringify({ action: 'start', profileId, config }),
       });
       if (!res.ok) {
         const data = await res.json();
@@ -320,10 +333,10 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
   stopSniper: async (profileId) => {
     set({ loading: true, error: null });
     try {
-      const res = await fetch('/api/mm', {
+      const res = await fetch('/api/sniper', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'stop-sniper', profileId }),
+        body: JSON.stringify({ action: 'stop', profileId }),
       });
       if (!res.ok) {
         const data = await res.json();

@@ -225,7 +225,7 @@ async function getTokenMeta(client: ClobClient, tokenId: string): Promise<{ tick
  */
 export async function placeProfileOrder(
   profile: ProfileCredentials,
-  params: { tokenId: string; side: 'BUY' | 'SELL'; price: number; size: number; taker?: boolean }
+  params: { tokenId: string; side: 'BUY' | 'SELL'; price: number; size: number; taker?: boolean; postOnly?: boolean }
 ) {
   trackClobAuthCall(); // createAndPostOrder
   const client = getClientForProfile(profile);
@@ -234,7 +234,11 @@ export async function placeProfileOrder(
   const tick = parseFloat(tickSize);
   let adjustedPrice = params.price;
 
-  if (params.taker) {
+  if (params.postOnly) {
+    // postOnly: CLOB server rejects if order would cross the spread → zero taker fee guaranteed.
+    // No need for manual maker enforcement — server handles it.
+    adjustedPrice = params.price;
+  } else if (params.taker) {
     // Taker mode: use caller's price directly (already set to bestAsk by sniper).
     // Do NOT re-fetch orderbook — price can spike between check and order.
     // params.price acts as a hard cap.
@@ -268,6 +272,9 @@ export async function placeProfileOrder(
       side: params.side as any,
     },
     { tickSize, negRisk },
+    undefined, // orderType (GTC default)
+    undefined, // deferExec
+    params.postOnly ?? false, // postOnly — zero taker fee, rejected if crosses spread
   ));
 }
 

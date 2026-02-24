@@ -4,6 +4,8 @@ const nextConfig = {
   experimental: {
     instrumentationHook: true,
   },
+  // Disable fetch response caching to prevent disk bloat (server-side API calls)
+  fetchCache: 'default-no-store',
 }
 
 module.exports = nextConfig
