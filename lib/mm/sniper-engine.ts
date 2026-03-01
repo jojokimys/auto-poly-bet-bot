@@ -8,11 +8,13 @@ import {
   type ProfileCredentials,
 } from '@/lib/bot/profile-client';
 import { getCryptoPrice, get5mRangePct } from '@/lib/polymarket/binance';
-import { redeemPositions, redeemPositionsRPC, fetchClaimablePositions, isConditionResolved, getWinningSide } from '@/lib/polymarket/redeem';
+import { redeemPositionsRPC, fetchClaimablePositions, isConditionResolved, getWinningSide } from '@/lib/polymarket/redeem';
 import { fetchBestBidAsk } from '@/lib/bot/orderbook';
 import { Wallet } from '@ethersproject/wallet';
 import { findActiveCryptoMarkets } from './market-finder';
-import { logTrade } from './trade-logger';
+import { RtdsWS } from './rtds-ws';
+import { takerFeePerShare } from './fees';
+import { logTrade, type TradeSkip } from './trade-logger';
 import type {
   SniperState,
   SniperConfig,
@@ -35,6 +37,57 @@ const ASSET_TO_SYMBOL: Record<string, import('@/lib/polymarket/binance').CryptoS
   XRP: 'XRPUSDT',
 };
 
+// ─── Choppy Market Detector ──────────────────────────────
+// Tracks whether spot price has crossed the strike in both directions
+// within a recent window. If yes → choppy/sideways → skip SOL.
+
+interface StrikeCrossing {
+  aboveStrike: boolean[];  // ring buffer of recent "above strike" checks
+  writeIdx: number;
+}
+
+const CROSSING_BUFFER_SIZE = 20;  // ~20 seconds of history at 1s checks
+// Survive Next.js HMR (same pattern as sniper instances)
+const globalForCrossing = globalThis as unknown as { __crossingHistory: Map<string, StrikeCrossing> };
+globalForCrossing.__crossingHistory ??= new Map();
+const crossingHistory = globalForCrossing.__crossingHistory;
+
+function recordStrikeCrossing(conditionId: string, spotPrice: number, strike: number): void {
+  let entry = crossingHistory.get(conditionId);
+  if (!entry) {
+    entry = { aboveStrike: new Array(CROSSING_BUFFER_SIZE).fill(spotPrice >= strike), writeIdx: 0 };
+    crossingHistory.set(conditionId, entry);
+  }
+  entry.aboveStrike[entry.writeIdx] = spotPrice >= strike;
+  entry.writeIdx = (entry.writeIdx + 1) % CROSSING_BUFFER_SIZE;
+}
+
+function isChoppyMarket(conditionId: string): boolean {
+  const entry = crossingHistory.get(conditionId);
+  if (!entry) return false;
+  const hasAbove = entry.aboveStrike.some(v => v === true);
+  const hasBelow = entry.aboveStrike.some(v => v === false);
+  return hasAbove && hasBelow;  // price crossed strike in both directions
+}
+
+function cleanupCrossings(activeIds: Set<string>): void {
+  for (const id of crossingHistory.keys()) {
+    if (!activeIds.has(id)) crossingHistory.delete(id);
+  }
+}
+
+// ─── Trending Detector ───────────────────────────────────
+// If all recent price samples are consistently on one side of strike → trending.
+// Used to increase position size.
+
+function isTrendingMarket(conditionId: string): boolean {
+  const entry = crossingHistory.get(conditionId);
+  if (!entry) return false;
+  const allAbove = entry.aboveStrike.every(v => v === true);
+  const allBelow = entry.aboveStrike.every(v => v === false);
+  return allAbove || allBelow;  // price consistently on one side
+}
+
 // ─── Sniper Instance ─────────────────────────────────────
 
 interface PendingRedeem {
@@ -55,9 +108,11 @@ interface SniperInstance {
   profile: ProfileCredentials;
   state: SniperState;
   config: SniperConfig;
+  rtds: RtdsWS;
   activeMarkets: Map<string, SniperMarket>;
   pendingRedeems: Map<string, PendingRedeem>;
-  claimedConditions: Set<string>;  // already claimed — skip on next scan
+  claimedConditions: Set<string>;  // confirmed claimed — skip on next scan
+  claimAttempts: Map<string, number>; // conditionId → attempt count (max 3)
   relayerBackoffUntil: number;     // timestamp: don't call relayer until this time (429 backoff)
   priceCheckTimer: ReturnType<typeof setInterval> | null;
   marketScanTimer: ReturnType<typeof setInterval> | null;
@@ -115,19 +170,33 @@ function log(
 // Near expiry → lower threshold (price has less time to reverse).
 // Further from expiry → higher threshold (need more safety margin).
 
+// ─── Mode Detection ─────────────────────────────────────
+// Parse time range from question (e.g., "1:00 PM - 1:05 PM") to determine 5m vs 15m
+
+function detectMode(question: string): '5m' | '15m' {
+  const m = question.match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (!m) return '15m';
+  let startH = parseInt(m[1]), startM = parseInt(m[2]);
+  let endH = parseInt(m[4]), endM = parseInt(m[5]);
+  if (m[3].toUpperCase() === 'PM' && startH !== 12) startH += 12;
+  if (m[3].toUpperCase() === 'AM' && startH === 12) startH = 0;
+  if (m[6].toUpperCase() === 'PM' && endH !== 12) endH += 12;
+  if (m[6].toUpperCase() === 'AM' && endH === 12) endH = 0;
+  const diff = (endH * 60 + endM) - (startH * 60 + startM);
+  return diff <= 7 ? '5m' : '15m';
+}
+
 function getAssetConfig(asset: string, config: SniperConfig): AssetSniperConfig {
   return config.assetConfigs[asset as CryptoAsset] ?? DEFAULT_ASSET_CONFIGS.BTC;
 }
 
 function getAdaptiveMinDiff(minutesLeft: number, assetBaseDiff: number): number {
-  // 0.2-1.2m window — closer to expiry = lower threshold (more certain)
+  // 0.2-0.75m window (12-45s) — closer to expiry = lower threshold (more certain)
   if (minutesLeft <= 0.25) return assetBaseDiff * 0.30;  // ~15s, 거의 확정
-  if (minutesLeft <= 0.35) return assetBaseDiff * 0.40;  // ~20s
-  if (minutesLeft <= 0.50) return assetBaseDiff * 0.55;  // ~30s
-  if (minutesLeft <= 0.65) return assetBaseDiff * 0.70;  // ~40s
-  if (minutesLeft <= 0.80) return assetBaseDiff * 0.85;  // ~48s
-  if (minutesLeft <= 1.00) return assetBaseDiff * 1.00;  // ~60s, 기본
-  return assetBaseDiff * 1.25;                             // ~72s, 더 보수적
+  if (minutesLeft <= 0.35) return assetBaseDiff * 0.45;  // ~21s
+  if (minutesLeft <= 0.50) return assetBaseDiff * 0.60;  // ~30s
+  if (minutesLeft <= 0.65) return assetBaseDiff * 0.80;  // ~39s
+  return assetBaseDiff * 1.00;                             // ~45s, 기본
 }
 
 // ─── Balance Cache ───────────────────────────────────────
@@ -162,13 +231,12 @@ function calcPositionSize(priceDiffPct: number, minutesLeft: number, balance: nu
   else if (absDiff >= 0.002) size = maxPosition * 0.55; // 0.20-0.30%
   else size = maxPosition * 0.40;                        // 0.12-0.20%
 
-  // Time multiplier: 0.2-1.2m range, closer = bigger
+  // Time multiplier: 0.2-0.75m range (12-45s), closer = bigger
   if (minutesLeft <= 0.25) size *= 1.5;       // +50% — ~15s, 거의 확정
-  else if (minutesLeft <= 0.40) size *= 1.3;  // +30% — ~24s
-  else if (minutesLeft <= 0.55) size *= 1.15; // +15% — ~33s
-  else if (minutesLeft <= 0.75) size *= 1.0;  // base — ~45s
-  else if (minutesLeft <= 1.00) size *= 0.80; // -20% — ~60s, 보수적
-  else size *= 0.60;                           // -40% — ~72s, 더 보수적
+  else if (minutesLeft <= 0.35) size *= 1.3;  // +30% — ~21s
+  else if (minutesLeft <= 0.50) size *= 1.15; // +15% — ~30s
+  else if (minutesLeft <= 0.65) size *= 1.0;  // base — ~39s
+  else size *= 0.85;                           // -15% — ~45s
 
   return Math.min(Math.max(1, Math.floor(size)), Math.floor(maxPosition));
 }
@@ -227,7 +295,29 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
     if (market.strikePrice === null) continue;
 
     try {
-      const spotPrice = await getCryptoPrice(symbol);
+      const rtdsPrice = inst.rtds.getSpotPrice(market.cryptoAsset as CryptoAsset);
+      const restPrice = rtdsPrice == null ? await getCryptoPrice(symbol) : null;
+      const spotPrice = rtdsPrice ?? restPrice!;
+      if (rtdsPrice == null) {
+        log(inst, 'info', 'price-fallback', `${market.cryptoAsset} RTDS unavailable — using Binance REST`);
+      }
+
+      // ── Record strike crossing for choppy/trending detection ──
+      recordStrikeCrossing(market.conditionId, spotPrice, market.strikePrice);
+
+      // ── Skip SOL on choppy markets (sideways whipsaw protection) ──
+      if (market.cryptoAsset === 'SOL' && isChoppyMarket(market.conditionId)) {
+        logTrade({
+          event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: market.cryptoAsset, conditionId: market.conditionId,
+          reason: 'choppy', secondsLeft: Math.round(minutesLeft * 60),
+          spotPrice, strikePrice: market.strikePrice,
+          priceDiffPct: (spotPrice - market.strikePrice) / market.strikePrice,
+          adaptiveThreshold: 0, confidence: 0,
+        });
+        continue;
+      }
+
       const priceDiffPct = (spotPrice - market.strikePrice) / market.strikePrice;
 
       const ac = getAssetConfig(market.cryptoAsset, inst.config);
@@ -265,6 +355,39 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
         continue;
       }
 
+      // Oracle agreement check: skip if Chainlink disagrees with Binance direction
+      if (!inst.rtds.oraclesAgree(market.cryptoAsset as CryptoAsset, market.strikePrice, spotPrice)) {
+        log(inst, 'info', 'skip-oracle', `${market.cryptoAsset} oracle disagree — Chainlink vs Binance`);
+        logTrade({
+          event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+          asset: market.cryptoAsset, conditionId: market.conditionId,
+          reason: 'oracle-mismatch', secondsLeft: Math.round(minutesLeft * 60),
+          spotPrice, strikePrice: market.strikePrice,
+          priceDiffPct, adaptiveThreshold: adaptiveDiff,
+          confidence: Math.abs(priceDiffPct) / adaptiveDiff,
+        });
+        continue;
+      }
+
+      // Momentum filter: skip if price is moving AGAINST our direction
+      const momentum = inst.rtds.getMomentum(market.cryptoAsset as CryptoAsset);
+      if (momentum !== null) {
+        const directionSign = priceDiffPct > 0 ? 1 : -1;  // +1 = YES (spot > strike), -1 = NO
+        // If momentum opposes our direction, skip (price reversing toward strike)
+        if (momentum * directionSign < -0.0001) {  // 0.01% adverse momentum threshold
+          log(inst, 'info', 'skip-momentum', `${market.cryptoAsset} momentum ${(momentum * 100).toFixed(4)}% against ${priceDiffPct > 0 ? 'YES' : 'NO'} direction`);
+          logTrade({
+            event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+            asset: market.cryptoAsset, conditionId: market.conditionId,
+            reason: 'momentum', secondsLeft: Math.round(minutesLeft * 60),
+            spotPrice, strikePrice: market.strikePrice,
+            priceDiffPct, adaptiveThreshold: adaptiveDiff,
+            confidence: Math.abs(priceDiffPct) / adaptiveDiff,
+          });
+          continue;
+        }
+      }
+
       const direction: 'YES' | 'NO' = priceDiffPct > 0 ? 'YES' : 'NO';
       const tokenId = direction === 'YES' ? market.yesTokenId : market.noTokenId;
 
@@ -276,13 +399,32 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
         logTrade({
           event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
           asset: market.cryptoAsset, conditionId: market.conditionId,
-          reason: (reason === 'no-book' ? 'no-ask' : reason) as any, secondsLeft: Math.round(minutesLeft * 60),
+          reason: (reason === 'no-book' ? 'no-ask' : reason) as TradeSkip['reason'], secondsLeft: Math.round(minutesLeft * 60),
           spotPrice, strikePrice: market.strikePrice!,
           priceDiffPct, adaptiveThreshold: adaptiveDiff,
           confidence: Math.abs(priceDiffPct) / adaptiveDiff,
           askPrice: book?.bestAsk ?? undefined, maxTokenPrice: ac.maxTokenPrice,
         });
         continue;
+      }
+
+      // Spread check: skip if bid-ask spread is too wide (thin book = bad fill)
+      if (book.bestBid) {
+        const spread = book.bestAsk - book.bestBid;
+        const maxSpread = 0.04; // 4c max spread
+        if (spread > maxSpread) {
+          log(inst, 'info', 'skip-spread', `${market.cryptoAsset} ${direction} spread ${(spread * 100).toFixed(1)}c > max ${maxSpread * 100}c (bid ${book.bestBid.toFixed(2)}, ask ${book.bestAsk.toFixed(2)})`);
+          logTrade({
+            event: 'skip', ts: new Date().toISOString(), profileId: inst.profileId,
+            asset: market.cryptoAsset, conditionId: market.conditionId,
+            reason: 'spread', secondsLeft: Math.round(minutesLeft * 60),
+            spotPrice, strikePrice: market.strikePrice!,
+            priceDiffPct, adaptiveThreshold: adaptiveDiff,
+            confidence: Math.abs(priceDiffPct) / adaptiveDiff,
+            askPrice: book.bestAsk, bidPrice: book.bestBid, spread,
+          });
+          continue;
+        }
       }
 
       const confidence = Math.abs(priceDiffPct) / adaptiveDiff;
@@ -317,7 +459,7 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
         log(inst, 'trade', 'buy', `BUY ${direction} ${market.cryptoAsset} @${book.bestAsk.toFixed(2)} x ${size} (${minutesLeft.toFixed(1)}m left, confidence: ${confidence.toFixed(1)}x)`);
         logTrade({
           event: 'entry', ts: new Date().toISOString(), profileId: inst.profileId,
-          asset: market.cryptoAsset, mode: market.question.includes('5 min') ? '5m' : '15m',
+          asset: market.cryptoAsset, mode: detectMode(market.question),
           conditionId: market.conditionId, direction,
           spotPrice, strikePrice: market.strikePrice!,
           priceDiffPct, adaptiveThreshold: adaptiveDiff, confidence,
@@ -325,7 +467,7 @@ async function _checkPriceAndSnipeInner(inst: SniperInstance): Promise<void> {
           askPrice: book.bestAsk, bidPrice: book.bestBid, spread: book.bestBid ? book.bestAsk - book.bestBid : null,
           size, usdcSize, balance, totalExposure: calcTotalExposure(inst),
           positionSizePct: usdcSize / balance,
-          expectedPnl: (1 - book.bestAsk) * size - 0.02 * size,
+          expectedPnl: (1 - book.bestAsk) * size - takerFeePerShare(book.bestAsk) * size,
         });
       } catch (orderErr) {
         // Order failed — rollback the pre-set entry state
@@ -437,6 +579,9 @@ async function checkExpiries(inst: SniperInstance): Promise<void> {
     }
   }
 
+  // Cleanup crossing history for expired markets
+  cleanupCrossings(new Set(inst.activeMarkets.keys()));
+
   // Immediately scan for next markets after any expiry
   if (inst.activeMarkets.size === 0 || [...inst.activeMarkets.values()].every((m) => m.entryTime !== null)) {
     refreshMarkets(inst).catch(() => {});
@@ -486,11 +631,11 @@ async function scanAndClaimResolved(inst: SniperInstance): Promise<void> {
 
       if (isWin) {
         const grossProfit = (1 - pending.entryPrice) * pending.held;
-        const fee = 0.02 * pending.held;
+        const fee = takerFeePerShare(pending.entryPrice) * pending.held;
         const netProfit = grossProfit - fee;
         inst.state.wins++;
         inst.state.grossPnl += netProfit;
-        log(inst, 'trade', 'redeem', `${pending.cryptoAsset} WIN! ${pending.direction} ${pending.held} shares @${pending.entryPrice.toFixed(2)} → net +$${netProfit.toFixed(3)}`);
+        log(inst, 'trade', 'redeem', `${pending.cryptoAsset} WIN! ${pending.direction} ${pending.held} shares @${pending.entryPrice.toFixed(2)} → net +$${netProfit.toFixed(3)} (fee $${fee.toFixed(4)})`);
         logTrade({
           event: 'exit', ts: new Date().toISOString(), profileId: inst.profileId,
           asset: pending.cryptoAsset, conditionId: pos.conditionId,
@@ -540,11 +685,11 @@ async function scanAndClaimResolved(inst: SniperInstance): Promise<void> {
 
         if (isWin) {
           const grossProfit = (1 - pending.entryPrice) * pending.held;
-          const fee = 0.02 * pending.held;
+          const fee = takerFeePerShare(pending.entryPrice) * pending.held;
           const netProfit = grossProfit - fee;
           inst.state.wins++;
           inst.state.grossPnl += netProfit;
-          log(inst, 'trade', 'redeem', `${pending.cryptoAsset} WIN (on-chain verified)! ${pending.direction} ${pending.held} shares @${pending.entryPrice.toFixed(2)} → net +$${netProfit.toFixed(3)}`);
+          log(inst, 'trade', 'redeem', `${pending.cryptoAsset} WIN (on-chain verified)! ${pending.direction} ${pending.held} shares @${pending.entryPrice.toFixed(2)} → net +$${netProfit.toFixed(3)} (fee $${fee.toFixed(4)})`);
           logTrade({
             event: 'exit', ts: new Date().toISOString(), profileId: inst.profileId,
             asset: pending.cryptoAsset, conditionId,
@@ -574,56 +719,54 @@ async function scanAndClaimResolved(inst: SniperInstance): Promise<void> {
       }
     }
 
-    // Filter out already-claimed positions
-    const unclaimed = claimable.filter((p) => !inst.claimedConditions.has(p.conditionId));
+    // Filter out already-claimed positions (max 3 attempts per position)
+    const unclaimed = claimable.filter((p) => {
+      const attempts = inst.claimAttempts.get(p.conditionId) ?? 0;
+      if (inst.claimedConditions.has(p.conditionId)) return false;
+      if (attempts >= 3) return false; // give up after 3 failed attempts
+      return true;
+    });
     if (unclaimed.length === 0) return;
 
-    const useRpc = Date.now() < inst.relayerBackoffUntil;
-    if (useRpc) {
-      log(inst, 'info', 'auto-claim', `Relayer rate-limited — using direct RPC for ${unclaimed.length} position(s)`);
-    }
-
-    log(inst, 'info', 'auto-claim', `Found ${unclaimed.length} claimable position(s) — redeeming via ${useRpc ? 'RPC' : 'relayer'}...`);
-    let claimed = 0;
+    log(inst, 'info', 'auto-claim', `Found ${unclaimed.length} claimable position(s) — claiming with receipt verification...`);
+    let confirmed = 0;
+    let failed = 0;
 
     for (const pos of unclaimed) {
+      const attempts = (inst.claimAttempts.get(pos.conditionId) ?? 0) + 1;
+      inst.claimAttempts.set(pos.conditionId, attempts);
+
       try {
         const yesTokenId = pos.outcomeIndex === 0 ? pos.asset : pos.oppositeAsset;
         const noTokenId = pos.outcomeIndex === 1 ? pos.asset : pos.oppositeAsset;
 
-        // Try relayer first, fallback to RPC on 429
-        let result = useRpc
-          ? await redeemPositionsRPC(inst.profile, pos.conditionId, pos.negativeRisk, yesTokenId, noTokenId)
-          : await redeemPositions(inst.profile, pos.conditionId, pos.negativeRisk, yesTokenId, noTokenId);
-
-        // Relayer 429 → fallback to RPC immediately
-        if (!result.success && !useRpc && (result.error?.includes('429') || result.error?.includes('quota') || result.error?.includes('Too Many'))) {
-          const match = result.error.match(/resets in (\d+)/);
-          const backoffSec = match ? parseInt(match[1]) : 600;
-          inst.relayerBackoffUntil = Date.now() + backoffSec * 1000;
-          log(inst, 'warn', 'auto-claim', `Relayer quota exceeded — switching to RPC (backoff ${Math.round(backoffSec / 60)}m)`);
-          result = await redeemPositionsRPC(inst.profile, pos.conditionId, pos.negativeRisk, yesTokenId, noTokenId);
-        }
+        const result = await redeemPositionsRPC(inst.profile, pos.conditionId, pos.negativeRisk, yesTokenId, noTokenId);
 
         if (result.success && result.txHash) {
-          claimed++;
+          // TX confirmed on-chain — mark as claimed
           inst.claimedConditions.add(pos.conditionId);
-          log(inst, 'trade', 'auto-claim', `Claimed "${pos.title}" (${pos.outcome}, ${pos.size} shares) → tx: ${result.txHash.slice(0, 10)}...`);
-        } else if (!result.success) {
-          log(inst, 'warn', 'auto-claim', `Claim failed "${pos.title}": ${result.error}`);
+          confirmed++;
+          log(inst, 'trade', 'auto-claim', `Claimed "${pos.title}" (${pos.outcome}, ${pos.size} shares) — confirmed tx: ${result.txHash.slice(0, 10)}...`);
+        } else if (result.txHash) {
+          // TX sent but receipt failed — will retry next scan
+          failed++;
+          log(inst, 'warn', 'auto-claim', `Claim unconfirmed "${pos.title}" (attempt ${attempts}/3): ${result.error}`);
+        } else if (result.error) {
+          failed++;
+          log(inst, 'warn', 'auto-claim', `Claim TX failed "${pos.title}" (attempt ${attempts}/3): ${result.error}`);
+        } else {
+          // No tokens to claim (balance zero) — mark as done
+          inst.claimedConditions.add(pos.conditionId);
         }
       } catch (err) {
+        failed++;
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('429') || msg.includes('quota') || msg.includes('Too Many')) {
-          inst.relayerBackoffUntil = Date.now() + 600_000;
-          log(inst, 'warn', 'auto-claim', `Relayer quota exceeded — backing off 10m`);
-        }
-        log(inst, 'warn', 'auto-claim', `Error claiming "${pos.title}": ${msg}`);
+        log(inst, 'warn', 'auto-claim', `Error claiming "${pos.title}" (attempt ${attempts}/3): ${msg}`);
       }
     }
 
-    if (claimed > 0) {
-      log(inst, 'info', 'auto-claim', `Auto-claim done: ${claimed}/${unclaimed.length} redeemed`);
+    if (confirmed > 0 || failed > 0) {
+      log(inst, 'info', 'auto-claim', `Auto-claim done: ${confirmed} confirmed, ${failed} failed out of ${unclaimed.length}`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -652,6 +795,10 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
 
   const config: SniperConfig = { ...DEFAULT_SNIPER_CONFIG, ...configOverrides };
 
+  // Reuse existing RTDS connection if restarting, otherwise create new
+  const rtds = existing?.rtds ?? new RtdsWS();
+  if (!rtds.isConnected()) rtds.connect();
+
   const inst: SniperInstance = {
     profileId,
     profileName: profile.name,
@@ -668,9 +815,11 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
       error: null,
     },
     config,
+    rtds,
     activeMarkets: new Map(),
     pendingRedeems: existing?.pendingRedeems ?? new Map(),
     claimedConditions: existing?.claimedConditions ?? new Set(),
+    claimAttempts: existing?.claimAttempts ?? new Map(),
     relayerBackoffUntil: 0,
     priceCheckTimer: null,
     marketScanTimer: null,
@@ -702,7 +851,7 @@ export async function startSniper(profileId: string, configOverrides?: Partial<S
   inst.priceCheckTimer = setInterval(() => checkPriceAndSnipe(inst), config.priceCheckIntervalMs);
   inst.marketScanTimer = setInterval(() => refreshMarkets(inst), config.marketScanIntervalMs);
   inst.expiryTimer = setInterval(() => checkExpiries(inst), 5000);
-  inst.claimTimer = setInterval(() => scanAndClaimResolved(inst), 120_000); // every 2 min (Data API only, no RPC)
+  inst.claimTimer = setInterval(() => scanAndClaimResolved(inst), 120_000); // every 2 min — verify claims
 
   // Run initial auto-claim scan after 10s (catch positions from previous sessions)
   setTimeout(() => scanAndClaimResolved(inst), 10_000);
@@ -732,6 +881,7 @@ export async function stopSniper(profileId: string): Promise<SniperState> {
   if (inst.marketScanTimer) clearInterval(inst.marketScanTimer);
   if (inst.expiryTimer) clearInterval(inst.expiryTimer);
   if (inst.claimTimer) clearInterval(inst.claimTimer);
+  inst.rtds.disconnect();
 
   log(inst, 'info', 'stop', `Sniper stopped (trades: ${inst.state.totalTrades}, wins: ${inst.state.wins}, losses: ${inst.state.losses}, PnL: $${inst.state.grossPnl.toFixed(3)})`);
 
@@ -786,10 +936,16 @@ export function getSniperDetail(profileId: string): SniperDetail | null {
     };
   });
 
+  const chainlinkPrices: Record<string, number | null> = {};
+  for (const asset of ['BTC', 'ETH', 'SOL', 'XRP'] as CryptoAsset[]) {
+    chainlinkPrices[asset] = inst.rtds.getChainlinkPrice(asset);
+  }
+
   return {
     state: { ...inst.state },
     markets,
     config: { ...inst.config },
+    chainlinkPrices,
   };
 }
 

@@ -412,6 +412,7 @@ async function checkFills(inst: MMInstance): Promise<void> {
         const profit = 1 - cost;
         const shares = Math.min(market.yesHeld, market.noHeld);
         inst.state.roundTrips++;
+        inst.state.wins++;
         inst.state.grossPnl += profit * shares;
         log(inst, 'trade', 'round-trip', `${market.cryptoAsset} round trip! cost=${cost.toFixed(3)} profit=${(profit * shares).toFixed(3)} (${shares} shares)`);
 
@@ -478,6 +479,7 @@ async function sellPosition(inst: MMInstance, market: ActiveMarket, side: 'yes' 
 
     const pnl = (netSellPrice - (entryPrice ?? 0)) * held;
     inst.state.fillsSell++;
+    if (pnl >= 0) inst.state.wins++; else inst.state.losses++;
     inst.state.grossPnl += pnl;
 
     log(inst, 'trade', 'sell', `${market.cryptoAsset} SELL ${side.toUpperCase()} @${sellPrice} × ${held} (pnl: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)})`);
@@ -831,6 +833,8 @@ export async function startMM(profileId: string, configOverrides?: Partial<MMCon
       fillsBuy: 0,
       fillsSell: 0,
       roundTrips: 0,
+      wins: 0,
+      losses: 0,
       grossPnl: 0,
       totalExposure: 0,
       rtdsConnected: false,
@@ -921,6 +925,8 @@ export async function stopMM(profileId: string): Promise<MMState> {
       fillsBuy: 0,
       fillsSell: 0,
       roundTrips: 0,
+      wins: 0,
+      losses: 0,
       grossPnl: 0,
       totalExposure: 0,
       rtdsConnected: false,
@@ -949,7 +955,9 @@ export async function stopMM(profileId: string): Promise<MMState> {
 
   inst.ws.disconnect();
 
-  log(inst, 'info', 'stop', `Market maker stopped (quotes: ${inst.state.quotesPlaced}, fills: ${inst.state.fillsBuy}/${inst.state.fillsSell}, PnL: $${inst.state.grossPnl.toFixed(3)})`);
+  const total = inst.state.wins + inst.state.losses;
+  const winPct = total > 0 ? ((inst.state.wins / total) * 100).toFixed(0) : '–';
+  log(inst, 'info', 'stop', `Market maker stopped (quotes: ${inst.state.quotesPlaced}, W/L: ${inst.state.wins}/${inst.state.losses} (${winPct}%), PnL: $${inst.state.grossPnl.toFixed(3)})`);
 
   return { ...inst.state };
 }
@@ -961,7 +969,7 @@ export function getMMState(profileId?: string): MMState | Record<string, MMState
       return {
         status: 'stopped', startedAt: null, volatilityRegime: 'volatile',
         activeMarkets: 0, quotesPlaced: 0, fillsBuy: 0, fillsSell: 0,
-        roundTrips: 0, grossPnl: 0, totalExposure: 0, rtdsConnected: false, error: null,
+        roundTrips: 0, wins: 0, losses: 0, grossPnl: 0, totalExposure: 0, rtdsConnected: false, error: null,
       };
     }
     return { ...inst.state };

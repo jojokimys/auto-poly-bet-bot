@@ -2,7 +2,7 @@
  * Polymarket RTDS WebSocket — real-time crypto spot prices.
  *
  * Connects to wss://ws-live-data.polymarket.com (free, no auth).
- * Subscribes to `crypto_prices` topic (Binance source, ~1s updates).
+ * Subscribes to `crypto_prices` (Binance) and `crypto_prices_chainlink` (settlement oracle).
  * Provides sync getSpotPrice() — no API calls, just reads in-memory map.
  */
 
@@ -28,12 +28,22 @@ const SYMBOL_TO_ASSET: Record<string, CryptoAsset> = {
   xrpusdt: 'XRP',
 };
 
+/** Chainlink RTDS symbols → asset (settlement oracle) */
+const CHAINLINK_SYMBOL_TO_ASSET: Record<string, CryptoAsset> = {
+  'btc/usd': 'BTC',
+  'eth/usd': 'ETH',
+  'sol/usd': 'SOL',
+  'xrp/usd': 'XRP',
+};
+
 export interface SpotPriceEntry {
   price: number;
   timestamp: number;
 }
 
 type PriceHandler = (asset: CryptoAsset, price: number, timestamp: number) => void;
+
+const PRICE_HISTORY_SIZE = 10; // ~10s of history at ~1s updates
 
 export class RtdsWS {
   private ws: WebSocket | null = null;
@@ -42,6 +52,8 @@ export class RtdsWS {
   private reconnectDelay = 1000;
   private intentionalClose = false;
   private prices: Map<CryptoAsset, SpotPriceEntry> = new Map();
+  private chainlinkPrices: Map<CryptoAsset, SpotPriceEntry> = new Map();
+  private priceHistory: Map<CryptoAsset, SpotPriceEntry[]> = new Map();
   private onPrice: PriceHandler | null = null;
 
   connect(onPrice?: PriceHandler): void {
@@ -67,6 +79,12 @@ export class RtdsWS {
         channel: 'crypto_prices',
       }));
 
+      // Subscribe to Chainlink crypto prices (settlement oracle)
+      this.ws!.send(JSON.stringify({
+        type: 'subscribe',
+        channel: 'crypto_prices_chainlink',
+      }));
+
       // Start heartbeat
       this.stopHeartbeat();
       this.heartbeatTimer = setInterval(() => {
@@ -83,34 +101,16 @@ export class RtdsWS {
       try {
         const parsed = JSON.parse(msg);
 
-        // RTDS sends: { symbol, value, timestamp } for crypto_prices
+        // RTDS sends: { symbol, value, timestamp } for crypto_prices / crypto_prices_chainlink
         if (parsed.symbol && parsed.value != null) {
-          const symbol = String(parsed.symbol).toLowerCase();
-          const asset = SYMBOL_TO_ASSET[symbol];
-          if (asset) {
-            const price = typeof parsed.value === 'string' ? parseFloat(parsed.value) : parsed.value;
-            const timestamp = parsed.timestamp ?? Date.now();
-            if (Number.isFinite(price) && price > 0) {
-              this.prices.set(asset, { price, timestamp });
-              this.onPrice?.(asset, price, timestamp);
-            }
-          }
+          this._handlePriceItem(parsed);
         }
 
         // Also handle array format: { data: [{ symbol, value, timestamp }, ...] }
         if (Array.isArray(parsed.data)) {
           for (const item of parsed.data) {
             if (item.symbol && item.value != null) {
-              const symbol = String(item.symbol).toLowerCase();
-              const asset = SYMBOL_TO_ASSET[symbol];
-              if (asset) {
-                const price = typeof item.value === 'string' ? parseFloat(item.value) : item.value;
-                const timestamp = item.timestamp ?? Date.now();
-                if (Number.isFinite(price) && price > 0) {
-                  this.prices.set(asset, { price, timestamp });
-                  this.onPrice?.(asset, price, timestamp);
-                }
-              }
+              this._handlePriceItem(item);
             }
           }
         }
@@ -132,13 +132,80 @@ export class RtdsWS {
     });
   }
 
-  /** Get spot price for an asset (sync, no API call). Returns null if no data yet. */
+  private _handlePriceItem(item: { symbol: string; value: string | number; timestamp?: number }): void {
+    const symbol = String(item.symbol).toLowerCase();
+    const price = typeof item.value === 'string' ? parseFloat(item.value) : item.value;
+    const timestamp = item.timestamp ?? Date.now();
+    if (!Number.isFinite(price) || price <= 0) return;
+
+    // Check Binance source first
+    const binanceAsset = SYMBOL_TO_ASSET[symbol];
+    if (binanceAsset) {
+      this.prices.set(binanceAsset, { price, timestamp });
+      // Record price history for momentum calculation
+      let history = this.priceHistory.get(binanceAsset);
+      if (!history) { history = []; this.priceHistory.set(binanceAsset, history); }
+      history.push({ price, timestamp });
+      if (history.length > PRICE_HISTORY_SIZE) history.shift();
+      this.onPrice?.(binanceAsset, price, timestamp);
+      return;
+    }
+
+    // Check Chainlink source
+    const chainlinkAsset = CHAINLINK_SYMBOL_TO_ASSET[symbol];
+    if (chainlinkAsset) {
+      this.chainlinkPrices.set(chainlinkAsset, { price, timestamp });
+    }
+  }
+
+  /** Get Binance spot price for an asset (sync). Returns null if stale/missing. */
   getSpotPrice(asset: CryptoAsset): number | null {
     const entry = this.prices.get(asset);
     if (!entry) return null;
     // Stale if older than 30s
     if (Date.now() - entry.timestamp > 30_000) return null;
     return entry.price;
+  }
+
+  /** Get Chainlink oracle price for an asset (sync). Returns null if stale/missing. */
+  getChainlinkPrice(asset: CryptoAsset): number | null {
+    const entry = this.chainlinkPrices.get(asset);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > 30_000) return null;
+    return entry.price;
+  }
+
+  /**
+   * Check if Chainlink oracle agrees with the given spot price direction relative to strike.
+   * @param asset - crypto asset
+   * @param strike - market strike price
+   * @param spotPrice - current spot price from Binance REST (the sniper's primary source)
+   * Returns true if Chainlink agrees with spotPrice direction, or if Chainlink data is unavailable.
+   */
+  oraclesAgree(asset: CryptoAsset, strike: number, spotPrice: number): boolean {
+    const chainlink = this.getChainlinkPrice(asset);
+    if (!chainlink) return true;      // no Chainlink data = fallback to Binance only
+    // If Chainlink is within 0.05% of strike, it's too close to disagree meaningfully
+    const chainlinkDiffPct = Math.abs(chainlink - strike) / strike;
+    if (chainlinkDiffPct < 0.0005) return true;  // trust Binance alone
+    // Chainlink and spot must agree on direction
+    return (spotPrice >= strike) === (chainlink >= strike);
+  }
+
+  /**
+   * Get price momentum as % change over recent history.
+   * Positive = price rising, negative = price falling.
+   * Returns null if insufficient history.
+   */
+  getMomentum(asset: CryptoAsset): number | null {
+    const history = this.priceHistory.get(asset);
+    if (!history || history.length < 3) return null;
+    // Compare oldest vs newest in the ring buffer
+    const oldest = history[0];
+    const newest = history[history.length - 1];
+    // Skip if history span is too old (>15s gap = stale)
+    if (newest.timestamp - oldest.timestamp > 15_000) return null;
+    return (newest.price - oldest.price) / oldest.price;
   }
 
   /** Get all current spot prices */
@@ -167,6 +234,8 @@ export class RtdsWS {
       this.ws = null;
     }
     this.prices.clear();
+    this.chainlinkPrices.clear();
+    this.priceHistory.clear();
   }
 
   private stopHeartbeat(): void {

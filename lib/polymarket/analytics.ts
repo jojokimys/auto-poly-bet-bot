@@ -27,6 +27,14 @@ export function parseTrade(
   const cost = price * size;
   const fee = cost * (feeRateBps / 10_000);
 
+  // match_time can be Unix seconds string ("1771085685") or ISO string
+  let matchTime = t.match_time;
+  const asNum = Number(matchTime);
+  if (!isNaN(asNum) && asNum > 1_000_000_000 && asNum < 2_000_000_000) {
+    // Unix seconds → ISO string
+    matchTime = new Date(asNum * 1000).toISOString();
+  }
+
   return {
     id: t.id,
     market: t.market,
@@ -37,7 +45,7 @@ export function parseTrade(
     size,
     fee,
     cost,
-    matchTime: t.match_time,
+    matchTime,
     realizedPnl: null,
     profileId,
     profileName,
@@ -113,9 +121,6 @@ export function computeStats(
   const wins = sells.filter((t) => t.realizedPnl! > 0);
   const losses = sells.filter((t) => t.realizedPnl! < 0);
 
-  const totalPnl = sells.reduce((sum, t) => sum + t.realizedPnl!, 0);
-  const grossProfit = wins.reduce((sum, t) => sum + t.realizedPnl!, 0);
-  const grossLoss = Math.abs(losses.reduce((sum, t) => sum + t.realizedPnl!, 0));
   const totalFees = trades.reduce((sum, t) => sum + t.fee, 0);
 
   // Count open positions and compute position value using FIFO entry prices
@@ -155,12 +160,30 @@ export function computeStats(
     }
   }
 
+  // Balance-based PnL: infer starting balance by reversing all trades,
+  // then PnL = currentBalance + openPositionValue - inferredStart.
+  // This captures resolved positions (redeemed wins add to balance,
+  // expired losses reduce it) that never appear as SELL trades.
+  let inferredStart = currentBalance;
+  for (let i = trades.length - 1; i >= 0; i--) {
+    const t = trades[i];
+    if (t.side === 'BUY') {
+      inferredStart += t.cost + t.fee;
+    } else {
+      inferredStart -= t.cost - t.fee;
+    }
+  }
+  const totalPnl = currentBalance + positionValue - inferredStart;
+
+  const grossProfit = wins.reduce((sum, t) => sum + t.realizedPnl!, 0);
+  const grossLoss = Math.abs(losses.reduce((sum, t) => sum + t.realizedPnl!, 0));
   const pnlValues = sells.map((t) => t.realizedPnl!);
 
   return {
     totalTrades: trades.length,
     totalBuys: trades.filter((t) => t.side === 'BUY').length,
     totalSells: sells.length,
+    wins: wins.length,
     winRate: sells.length > 0 ? wins.length / sells.length : 0,
     totalPnl,
     avgTradeSize: trades.length > 0
@@ -320,6 +343,7 @@ async function getDashboardDataForProfile(
         totalTrades: 0,
         totalBuys: 0,
         totalSells: 0,
+        wins: 0,
         winRate: 0,
         totalPnl: 0,
         avgTradeSize: 0,
@@ -361,6 +385,7 @@ async function getDashboardDataForAllProfiles(): Promise<DashboardData> {
         totalTrades: 0,
         totalBuys: 0,
         totalSells: 0,
+        wins: 0,
         winRate: 0,
         totalPnl: 0,
         avgTradeSize: 0,

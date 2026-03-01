@@ -343,57 +343,54 @@ export async function redeemPositionsRPC(
     const account = privateKeyToAccount(profile.privateKey as Hex);
     const isProxy = profile.funderAddress && profile.funderAddress.toLowerCase() !== account.address.toLowerCase();
 
-    let lastError: string | null = null;
-    for (let attempt = 0; attempt < TX_RPCS.length; attempt++) {
-      const rpcUrl = getTxRpcUrl();
-      const walletClient = createWalletClient({ account, chain: polygon, transport: http(rpcUrl) });
-      const publicClient = createPublicClient({ chain: polygon, transport: http(rpcUrl) });
+    const rpcUrl = getTxRpcUrl();
+    const walletClient = createWalletClient({ account, chain: polygon, transport: http(rpcUrl) });
+    const publicClient = createPublicClient({ chain: polygon, transport: http(rpcUrl) });
 
-      try {
-        const gasPrice = await getCachedGasPrice(publicClient);
+    const gasPrice = await getCachedGasPrice(publicClient);
 
-        let txHash: Hex;
-        if (isProxy) {
-          txHash = await walletClient.writeContract({
-            chain: polygon,
-            address: PROXY_WALLET_FACTORY as Hex,
-            abi: PROXY_FACTORY_ABI,
-            functionName: 'proxy',
-            args: [[{
-              typeCode: 1,
-              to: innerTo as Hex,
-              value: 0n,
-              data: innerData,
-            }]],
-            gas: PROXY_REDEEM_GAS,
-            gasPrice,
-          });
-        } else {
-          txHash = await walletClient.sendTransaction({
-            chain: polygon,
-            to: innerTo as Hex,
-            data: innerData,
-            value: 0n,
-            gas: EOA_REDEEM_GAS,
-            gasPrice,
-          });
-        }
-
-        const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
-        const success = receipt.status === 'success';
-        return { success, txHash, error: success ? null : 'Transaction reverted', winningSide };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (isRetryableRpcError(msg) && attempt < TX_RPCS.length - 1) {
-          switchToNextRpc();
-          lastError = msg;
-          continue;
-        }
-        return { success: false, txHash: null, error: msg, winningSide };
-      }
+    let txHash: Hex;
+    if (isProxy) {
+      txHash = await walletClient.writeContract({
+        chain: polygon,
+        address: PROXY_WALLET_FACTORY as Hex,
+        abi: PROXY_FACTORY_ABI,
+        functionName: 'proxy',
+        args: [[{
+          typeCode: 1,
+          to: innerTo as Hex,
+          value: 0n,
+          data: innerData,
+        }]],
+        gas: PROXY_REDEEM_GAS,
+        gasPrice,
+      });
+    } else {
+      txHash = await walletClient.sendTransaction({
+        chain: polygon,
+        to: innerTo as Hex,
+        data: innerData,
+        value: 0n,
+        gas: EOA_REDEEM_GAS,
+        gasPrice,
+      });
     }
 
-    return { success: false, txHash: null, error: lastError ?? 'All RPCs failed', winningSide };
+    // Wait for TX receipt to verify it actually confirmed
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        timeout: 60_000, // 60s timeout
+      });
+      if (receipt.status === 'reverted') {
+        return { success: false, txHash, error: 'TX reverted on-chain', winningSide };
+      }
+      return { success: true, txHash, error: null, winningSide };
+    } catch (receiptErr) {
+      // TX was sent but receipt timed out — may still confirm later
+      const receiptMsg = receiptErr instanceof Error ? receiptErr.message : String(receiptErr);
+      return { success: false, txHash, error: `TX sent but receipt failed: ${receiptMsg}`, winningSide };
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, txHash: null, error: msg, winningSide: null };

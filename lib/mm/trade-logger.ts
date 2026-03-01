@@ -53,7 +53,7 @@ export interface TradeSkip {
   profileId: string;
   asset: string;
   conditionId: string;
-  reason: 'threshold' | 'price-too-high' | 'price-too-low' | 'no-ask' | 'order-failed';
+  reason: 'threshold' | 'price-too-high' | 'price-too-low' | 'no-ask' | 'order-failed' | 'volatile' | 'choppy' | 'oracle-mismatch' | 'momentum' | 'spread';
   secondsLeft: number;
   spotPrice: number;
   strikePrice: number;
@@ -61,7 +61,10 @@ export interface TradeSkip {
   adaptiveThreshold: number;
   confidence: number;
   askPrice?: number;
+  bidPrice?: number;
+  spread?: number;
   maxTokenPrice?: number;
+  rangePct?: number;
   error?: string;
 }
 

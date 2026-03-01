@@ -71,6 +71,8 @@ export interface MMState {
   fillsBuy: number;
   fillsSell: number;
   roundTrips: number;
+  wins: number;
+  losses: number;
   grossPnl: number;
   totalExposure: number;
   rtdsConnected: boolean;
@@ -190,7 +192,7 @@ export const DEFAULT_SNIPER_CONFIG: SniperConfig = {
   ],
   assetConfigs: { ...DEFAULT_ASSET_CONFIGS },
   minMinutesLeft: 0.2,        // 12s — enter even closer to expiry
-  maxMinutesLeft: 1.2,        // 72s — wider window for liquidity
+  maxMinutesLeft: 0.75,       // 45s — tighter window for higher conviction
   minTokenPrice: 0.80,        // reject below 80¢ (uncertain market = coin flip)
   maxPositionPct: 0.15,       // 15% of balance per position
   maxExposurePct: 0.80,       // 80% of balance total exposure (unused, kept for config)
@@ -224,6 +226,7 @@ export interface SniperDetail {
   state: SniperState;
   markets: SniperMarketInfo[];
   config: SniperConfig;
+  chainlinkPrices?: Record<string, number | null>;
 }
 
 export interface SniperMarketInfo {

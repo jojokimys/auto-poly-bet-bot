@@ -1,5 +1,25 @@
 /** Dashboard analytics types */
 
+export interface PortfolioDateRange {
+  after?: string;  // ISO date string (YYYY-MM-DD)
+  before?: string; // ISO date string (YYYY-MM-DD)
+}
+
+export interface DailyPnl {
+  date: string;  // YYYY-MM-DD
+  pnl: number;
+  wins: number;
+  losses: number;
+}
+
+export interface PortfolioStats {
+  totalPnl: number;
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+}
+
 export interface DashboardTrade {
   id: string;
   market: string;
@@ -20,6 +40,7 @@ export interface DashboardStats {
   totalTrades: number;
   totalBuys: number;
   totalSells: number;
+  wins: number;
   winRate: number;
   totalPnl: number;
   avgTradeSize: number;
