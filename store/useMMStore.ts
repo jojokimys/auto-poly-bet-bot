@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { MMState, MMConfig, VolatilityState, CryptoAsset, MarketMode, SniperState, SniperDetail, SniperConfig } from '@/lib/mm/types';
 import type { BotLogEntry } from '@/lib/bot/types';
+import type { PortfolioStats, PortfolioDateRange, DailyPnl } from '@/lib/types/dashboard';
 
 interface MMMarketDetail {
   conditionId: string;
@@ -57,6 +58,54 @@ export interface ScannedMarket {
   midpoint: number | null;
 }
 
+// ─── Sniper Trade Session Types ──────────────────────────
+
+export interface SniperMatchedTrade {
+  conditionId: string;
+  asset: string;
+  mode: string;
+  direction: 'YES' | 'NO';
+  entryTs: string;
+  exitTs: string | null;
+  entryPrice: number;
+  spotPrice: number;
+  strikePrice: number;
+  priceDiffPct: number;
+  confidence: number;
+  secondsLeft: number;
+  size: number;
+  usdcSize: number;
+  result: 'win' | 'loss' | 'pending';
+  pnl: number;
+  holdDurationSec: number | null;
+}
+
+export interface SniperTradeSession {
+  id: string;
+  startTs: string;
+  endTs: string;
+  trades: SniperMatchedTrade[];
+  totalPnl: number;
+  wins: number;
+  losses: number;
+  pending: number;
+  totalSize: number;
+}
+
+export interface SniperTradeSummary {
+  totalPnl: number;
+  totalWins: number;
+  totalLosses: number;
+  totalTrades: number;
+}
+
+export interface SniperPnlPoint {
+  ts: string;
+  pnl: number;
+  asset: string;
+  result: string;
+}
+
 interface MMStoreState {
   states: Record<string, MMState>;
   detail: MMDetail | null;
@@ -76,9 +125,26 @@ interface MMStoreState {
   sniperDetail: SniperDetail | null;
   sniperLogs: BotLogEntry[];
 
+  // Sniper session trades
+  sniperSessions: SniperTradeSession[];
+  sniperTradeSummary: SniperTradeSummary | null;
+  sniperPnlChart: SniperPnlPoint[];
+  sniperTradesLoading: boolean;
+
+  // Polymarket API stats (from /api/portfolio)
+  portfolioStats: PortfolioStats | null;
+  portfolioLoading: boolean;
+  portfolioRange: PortfolioDateRange;
+
+  // Daily PnL for calendar heatmap
+  dailyPnl: DailyPnl[];
+  dailyPnlLoading: boolean;
+  portfolioBalance: number | null;
+
   _pollId: ReturnType<typeof setInterval> | null;
   _klineId: ReturnType<typeof setInterval> | null;
   _scanId: ReturnType<typeof setInterval> | null;
+  _portfolioPollId: ReturnType<typeof setInterval> | null;
 
   setSelectedProfile: (id: string | null) => void;
   setMarketOption: (asset: CryptoAsset, mode: MarketMode) => void;
@@ -86,12 +152,16 @@ interface MMStoreState {
   poll: () => Promise<void>;
   fetchKlines: () => Promise<void>;
   fetchScannedMarkets: () => Promise<void>;
+  fetchPortfolioStats: () => Promise<void>;
+  fetchDailyPnl: () => Promise<void>;
+  setPortfolioRange: (range: PortfolioDateRange) => void;
   startPolling: () => void;
   stopPolling: () => void;
   startMM: (profileId: string, config?: { mode?: MarketMode; assets?: CryptoAsset[]; maxPositionSize?: number }) => Promise<void>;
   stopMM: (profileId: string) => Promise<void>;
   startSniper: (profileId: string, config?: Partial<SniperConfig>) => Promise<void>;
   stopSniper: (profileId: string) => Promise<void>;
+  fetchSniperTrades: (days?: number) => Promise<void>;
 }
 
 // Extract order events from MM logs
@@ -129,12 +199,26 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
   sniperStates: {},
   sniperDetail: null,
   sniperLogs: [],
+  sniperSessions: [],
+  sniperTradeSummary: null,
+  sniperPnlChart: [],
+  sniperTradesLoading: false,
+  portfolioStats: null,
+  portfolioLoading: false,
+  portfolioRange: { after: new Date().toISOString().split('T')[0], before: new Date().toISOString().split('T')[0] },
+  dailyPnl: [],
+  dailyPnlLoading: false,
+  portfolioBalance: null,
   _pollId: null,
   _klineId: null,
   _scanId: null,
+  _portfolioPollId: null,
 
   setSelectedProfile: (id) => {
-    set({ selectedProfileId: id, detail: null, sniperDetail: null });
+    set({ selectedProfileId: id, detail: null, sniperDetail: null, portfolioStats: null, dailyPnl: [], portfolioBalance: null });
+    if (id) {
+      get().fetchDailyPnl();
+    }
   },
 
   setMarketOption: (asset, mode) => {
@@ -251,6 +335,49 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
     }
   },
 
+  fetchPortfolioStats: async () => {
+    const { selectedProfileId, portfolioRange } = get();
+    if (!selectedProfileId) return;
+    set({ portfolioLoading: true });
+    try {
+      const params = new URLSearchParams({ profileId: selectedProfileId });
+      if (portfolioRange.after) params.set('after', portfolioRange.after);
+      if (portfolioRange.before) params.set('before', portfolioRange.before);
+      const res = await fetch(`/api/portfolio?${params}`);
+      if (!res.ok) {
+        const text = await res.text();
+        console.error('[portfolioStats] API error:', res.status, text);
+      } else {
+        const data = await res.json();
+        set({ portfolioStats: data.stats ?? null });
+      }
+    } catch (err) {
+      console.error('[portfolioStats] fetch error:', err);
+    }
+    set({ portfolioLoading: false });
+  },
+
+  fetchDailyPnl: async () => {
+    const { selectedProfileId, dailyPnlLoading } = get();
+    if (!selectedProfileId || dailyPnlLoading) return;
+    set({ dailyPnlLoading: true });
+    try {
+      const res = await fetch(`/api/portfolio?profileId=${selectedProfileId}&daily=true`);
+      if (res.ok) {
+        const data = await res.json();
+        set({ dailyPnl: data.dailyPnl ?? [], portfolioBalance: data.balance ?? null });
+      }
+    } catch (err) {
+      console.error('[dailyPnl] fetch error:', err);
+    }
+    set({ dailyPnlLoading: false });
+  },
+
+  setPortfolioRange: (range) => {
+    set({ portfolioRange: range, portfolioStats: null });
+    get().fetchPortfolioStats();
+  },
+
   startPolling: () => {
     const { _pollId } = get();
     if (_pollId) return;
@@ -258,19 +385,21 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
     get().poll();
     get().fetchKlines();
     get().fetchScannedMarkets();
+    get().fetchDailyPnl();
 
     const pollId = setInterval(() => get().poll(), 3000);
     const klineId = setInterval(() => get().fetchKlines(), 15_000);
     const scanId = setInterval(() => get().fetchScannedMarkets(), 30_000);
-    set({ _pollId: pollId, _klineId: klineId, _scanId: scanId });
+    set({ _pollId: pollId, _klineId: klineId, _scanId: scanId, _portfolioPollId: null });
   },
 
   stopPolling: () => {
-    const { _pollId, _klineId, _scanId } = get();
+    const { _pollId, _klineId, _scanId, _portfolioPollId } = get();
     if (_pollId) clearInterval(_pollId);
     if (_klineId) clearInterval(_klineId);
     if (_scanId) clearInterval(_scanId);
-    set({ _pollId: null, _klineId: null, _scanId: null });
+    if (_portfolioPollId) clearInterval(_portfolioPollId);
+    set({ _pollId: null, _klineId: null, _scanId: null, _portfolioPollId: null });
   },
 
   startMM: async (profileId, config) => {
@@ -347,5 +476,29 @@ export const useMMStore = create<MMStoreState>((set, get) => ({
       set({ error: err instanceof Error ? err.message : 'Unknown error' });
     }
     set({ loading: false });
+  },
+
+  fetchSniperTrades: async (days = 7) => {
+    const { selectedProfileId, sniperTradesLoading } = get();
+    if (!selectedProfileId || sniperTradesLoading) return;
+    set({ sniperTradesLoading: true });
+    try {
+      const params = new URLSearchParams({
+        profileId: selectedProfileId,
+        days: String(days),
+      });
+      const res = await fetch(`/api/sniper/trades?${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        set({
+          sniperSessions: data.sessions ?? [],
+          sniperTradeSummary: data.summary ?? null,
+          sniperPnlChart: data.pnlChart ?? [],
+        });
+      }
+    } catch (err) {
+      console.error('[sniperTrades] fetch error:', err);
+    }
+    set({ sniperTradesLoading: false });
   },
 }));
