@@ -1,8 +1,8 @@
 #!/bin/bash
-# Periodically clear .next/cache every hour
+# Periodically clear .next/cache every 15 minutes
 # Launched as background process by `yarn dev`, killed on exit
 
-INTERVAL=3600  # 1 hour
+INTERVAL=900  # 15 minutes
 CACHE_DIR="$(dirname "$0")/../.next/cache"
 
 while true; do
