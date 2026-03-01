@@ -11,28 +11,37 @@ import {
   SelectItem,
   Input,
   Divider,
+  DateRangePicker,
+  Progress,
+  Spinner,
 } from '@heroui/react';
+import { today, getLocalTimeZone, parseDate, type CalendarDate } from '@internationalized/date';
 import { useMMStore } from '@/store/useMMStore';
 import { useProfileStore } from '@/store/useProfileStore';
-import type { MMState, VolatilityRegime, CryptoAsset, MarketMode } from '@/lib/mm/types';
+import type { MMState, CryptoAsset, MarketMode } from '@/lib/mm/types';
 import { ALL_CRYPTO_ASSETS, MM_PRESETS } from '@/lib/mm/types';
-
-const REGIME_COLORS: Record<VolatilityRegime, 'success' | 'warning' | 'danger' | 'default'> = {
-  calm: 'success',
-  normal: 'warning',
-  elevated: 'danger',
-  volatile: 'danger',
-};
 
 const MARKET_OPTIONS: { asset: CryptoAsset; mode: MarketMode; label: string }[] = [
   { asset: 'BTC', mode: '5m', label: 'BTC 5m' },
   ...ALL_CRYPTO_ASSETS.map((asset) => ({ asset, mode: '15m' as MarketMode, label: `${asset} 15m` })),
 ];
 
+function toCalendarDate(iso: string): CalendarDate {
+  return parseDate(iso);
+}
+
+function toISODate(d: CalendarDate): string {
+  return `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
+}
+
 export function MMControl() {
   const { profiles } = useProfileStore();
   const states = useMMStore((s) => s.states);
   const detail = useMMStore((s) => s.detail);
+  const portfolioStats = useMMStore((s) => s.portfolioStats);
+  const portfolioLoading = useMMStore((s) => s.portfolioLoading);
+  const portfolioRange = useMMStore((s) => s.portfolioRange);
+  const setPortfolioRange = useMMStore((s) => s.setPortfolioRange);
   const selectedProfileId = useMMStore((s) => s.selectedProfileId);
   const setSelectedProfile = useMMStore((s) => s.setSelectedProfile);
   const selectedAsset = useMMStore((s) => s.selectedAsset);
@@ -56,7 +65,6 @@ export function MMControl() {
   const selectedState: MMState | undefined = selectedProfileId ? states[selectedProfileId] : undefined;
   const isRunning = selectedState?.status === 'running';
 
-  const regime = detail?.volatility?.regime ?? selectedState?.volatilityRegime ?? 'volatile';
   const runningConfig = detail?.config;
 
   const handleMarketOptionChange = (asset: CryptoAsset, mode: MarketMode) => {
@@ -71,6 +79,15 @@ export function MMControl() {
       assets: [selectedAsset],
       maxPositionSize,
     });
+  };
+
+  const dateRangeValue = {
+    start: portfolioRange.after
+      ? toCalendarDate(portfolioRange.after)
+      : today(getLocalTimeZone()),
+    end: portfolioRange.before
+      ? toCalendarDate(portfolioRange.before)
+      : today(getLocalTimeZone()),
   };
 
   return (
@@ -175,30 +192,50 @@ export function MMControl() {
 
         <Divider />
 
-        <div className="grid grid-cols-2 gap-2">
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Regime</p>
-            <Chip size="sm" variant="flat" color={REGIME_COLORS[regime]}>
-              {regime}
-            </Chip>
-          </div>
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Markets</p>
-            <p className="text-lg font-bold text-gray-900 dark:text-white">
-              {selectedState?.activeMarkets ?? 0}
-            </p>
-          </div>
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Quotes</p>
-            <p className="text-lg font-bold text-gray-900 dark:text-white">
-              {selectedState?.quotesPlaced ?? 0}
-            </p>
-          </div>
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Fills</p>
-            <p className="text-lg font-bold text-gray-900 dark:text-white">
-              {(selectedState?.fillsBuy ?? 0) + (selectedState?.fillsSell ?? 0)}
-            </p>
+        <div className="space-y-2">
+          <p className="text-[10px] text-gray-500 uppercase font-semibold">Performance</p>
+
+          <DateRangePicker
+            size="sm"
+            variant="bordered"
+            aria-label="Date range"
+            maxValue={today(getLocalTimeZone())}
+            value={dateRangeValue}
+            onChange={(val) => {
+              if (!val) return;
+              setPortfolioRange({
+                after: toISODate(val.start),
+                before: toISODate(val.end),
+              });
+            }}
+          />
+
+          {portfolioLoading && (
+            <Progress size="sm" isIndeterminate aria-label="Loading portfolio" className="w-full" />
+          )}
+
+          <div className="relative">
+            {portfolioLoading && (
+              <div className="absolute inset-0 flex items-center justify-center bg-white/60 dark:bg-black/40 rounded-lg z-10">
+                <Spinner size="sm" />
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
+                <p className="text-[10px] text-gray-500 uppercase">Win Rate</p>
+                <p className="text-lg font-bold text-gray-900 dark:text-white">
+                  {portfolioStats && (portfolioStats.wins + portfolioStats.losses) > 0
+                    ? `${(portfolioStats.winRate * 100).toFixed(0)}% (${portfolioStats.wins}/${portfolioStats.wins + portfolioStats.losses})`
+                    : '--'}
+                </p>
+              </div>
+              <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
+                <p className="text-[10px] text-gray-500 uppercase">PnL</p>
+                <p className={`text-lg font-bold font-mono ${(portfolioStats?.totalPnl ?? 0) >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                  {portfolioStats ? `${portfolioStats.totalPnl >= 0 ? '+' : ''}$${portfolioStats.totalPnl.toFixed(2)}` : '--'}
+                </p>
+              </div>
+            </div>
           </div>
         </div>
 

@@ -45,6 +45,8 @@ function MiniChart({ asset, height }: MiniChartProps) {
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const strikeLinesRef = useRef<ISeriesApi<'Line'>[]>([]);
+  const chainlinkLineRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const chainlinkHistoryRef = useRef<{ time: number; value: number }[]>([]);
   const klinesRef = useRef<KlinePoint[]>([]);
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -221,6 +223,20 @@ function MiniChart({ asset, height }: MiniChartProps) {
 
     chartRef.current = chart;
     seriesRef.current = series;
+
+    // Chainlink oracle price line (purple, solid)
+    const chainlinkLine = chart.addSeries(LineSeries, {
+      color: '#a78bfa',
+      lineWidth: 1,
+      lineStyle: LineStyle.Solid,
+      crosshairMarkerVisible: false,
+      priceLineVisible: false,
+      lastValueVisible: true,
+      title: 'Chainlink',
+    });
+    chainlinkLineRef.current = chainlinkLine;
+    chainlinkHistoryRef.current = [];
+
     updateChartData();
 
     const ro = new ResizeObserver((entries) => {
@@ -237,8 +253,29 @@ function MiniChart({ asset, height }: MiniChartProps) {
       chartRef.current = null;
       seriesRef.current = null;
       strikeLinesRef.current = [];
+      chainlinkLineRef.current = null;
+      chainlinkHistoryRef.current = [];
     };
   }, [isDark, height]);
+
+  // Chainlink price line — accumulate time series from polling data
+  const chainlinkPrice = sniperDetail?.chainlinkPrices?.[asset] ?? null;
+  useEffect(() => {
+    if (!chainlinkLineRef.current || chainlinkPrice == null) return;
+    const now = Math.floor(Date.now() / 1000) as Time;
+    const history = chainlinkHistoryRef.current;
+
+    // Deduplicate: skip if same second
+    if (history.length > 0 && history[history.length - 1].time >= (now as number)) return;
+
+    history.push({ time: now as number, value: chainlinkPrice });
+    // Keep max 120 points (~6 min at 3s poll)
+    if (history.length > 120) history.shift();
+
+    chainlinkLineRef.current.setData(
+      history.map((h) => ({ time: h.time as Time, value: h.value })),
+    );
+  }, [chainlinkPrice]);
 
   // Strike lines — redraw when strikes change or klines update
   useEffect(() => {

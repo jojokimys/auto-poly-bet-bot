@@ -32,7 +32,6 @@ export function SniperControl() {
   const startSniper = useMMStore((s) => s.startSniper);
   const stopSniper = useMMStore((s) => s.stopSniper);
 
-  // Multi-select market selections — default all selected
   const [selectedSelections, setSelectedSelections] = useState<Set<string>>(
     () => new Set(DEFAULT_SNIPER_CONFIG.selections.map(selKey))
   );
@@ -56,7 +55,7 @@ export function SniperControl() {
     setSelectedSelections((prev) => {
       const next = new Set(prev);
       if (next.has(key)) {
-        if (next.size > 1) next.delete(key); // keep at least 1
+        if (next.size > 1) next.delete(key);
       } else {
         next.add(key);
       }
@@ -73,11 +72,6 @@ export function SniperControl() {
     });
   };
 
-  const winRate = selectedState && selectedState.totalTrades > 0
-    ? ((selectedState.wins / (selectedState.wins + selectedState.losses)) * 100)
-    : 0;
-
-  // Running config selections for display
   const runningSelKeys = new Set(
     runningConfig?.selections.map(selKey) ?? []
   );
@@ -183,37 +177,6 @@ export function SniperControl() {
           </div>
         </div>
 
-        <Divider />
-
-        <div className="grid grid-cols-2 gap-2">
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Markets</p>
-            <p className="text-lg font-bold text-gray-900 dark:text-white">
-              {selectedState?.activeMarkets ?? 0}
-            </p>
-          </div>
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Trades</p>
-            <p className="text-lg font-bold text-gray-900 dark:text-white">
-              {selectedState?.totalTrades ?? 0}
-            </p>
-          </div>
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">Win Rate</p>
-            <p className={`text-lg font-bold ${winRate >= 50 ? 'text-green-600' : 'text-red-500'}`}>
-              {selectedState && (selectedState.wins + selectedState.losses) > 0
-                ? `${winRate.toFixed(0)}%`
-                : '--'}
-            </p>
-          </div>
-          <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-3">
-            <p className="text-[10px] text-gray-500 uppercase">PnL</p>
-            <p className={`text-lg font-bold font-mono ${(selectedState?.grossPnl ?? 0) >= 0 ? 'text-green-600' : 'text-red-500'}`}>
-              {selectedState ? `${selectedState.grossPnl >= 0 ? '+' : ''}$${selectedState.grossPnl.toFixed(2)}` : '--'}
-            </p>
-          </div>
-        </div>
-
         {isRunning && runningConfig && (
           <div className="text-[11px] text-gray-500 space-y-1">
             <div className="flex justify-between">
@@ -221,8 +184,14 @@ export function SniperControl() {
               <span className="font-mono">${selectedState?.totalExposure?.toFixed(2) ?? '0.00'}</span>
             </div>
             <div className="flex justify-between">
-              <span>W / L</span>
-              <span className="font-mono">{selectedState?.wins ?? 0} / {selectedState?.losses ?? 0}</span>
+              <span>Win Rate</span>
+              <span className="font-mono">
+                {(() => {
+                  const w = selectedState?.wins ?? 0;
+                  const total = w + (selectedState?.losses ?? 0);
+                  return total > 0 ? `${Math.round((w / total) * 100)}% (${w}/${total})` : '--';
+                })()}
+              </span>
             </div>
             <div className="flex justify-between">
               <span>Entry Window</span>

@@ -75,13 +75,10 @@ export function StatsCards({ stats, loading }: StatsCardsProps) {
     },
     {
       label: 'Win Rate',
-      value: fmtPct(stats.winRate),
+      value: stats.totalSells > 0
+        ? `${fmt(stats.winRate * 100, 0)}% (${stats.wins}/${stats.totalSells})`
+        : '--',
       color: stats.winRate >= 0.5 ? 'text-green-500' : 'text-orange-500',
-    },
-    {
-      label: 'Total Trades',
-      value: stats.totalTrades.toString(),
-      color: 'text-purple-500',
     },
     {
       label: 'Avg Trade Size',
