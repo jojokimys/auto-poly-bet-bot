@@ -6,8 +6,8 @@ import { SignatureType } from '@polymarket/order-utils';
 import { Wallet } from '@ethersproject/wallet';
 import { prisma } from '@/lib/db/prisma';
 import { getEnv, getBuilderConfig } from '@/lib/config/env';
-import { trackClobCall, trackClobAuthCall } from './api-tracker';
-import { fetchBestBidAsk } from './orderbook';
+// No-op API call tracker (was in api-tracker.ts)
+function trackClobAuthCall() { /* no-op */ }
 
 const CHAIN_ID = 137;
 
@@ -244,18 +244,8 @@ export async function placeProfileOrder(
     // params.price acts as a hard cap.
     adjustedPrice = params.price;
   } else {
-    // Maker enforcement: ensure price doesn't cross the spread
-    const book = await fetchBestBidAsk(params.tokenId);
-    if (book) {
-      if (params.side === 'BUY' && book.bestAsk !== null && params.price >= book.bestAsk) {
-        adjustedPrice = book.bestAsk - tick;
-        console.log(`[maker] BUY price adjusted: ${params.price} → ${adjustedPrice} (bestAsk: ${book.bestAsk})`);
-      }
-      if (params.side === 'SELL' && book.bestBid !== null && params.price <= book.bestBid) {
-        adjustedPrice = book.bestBid + tick;
-        console.log(`[maker] SELL price adjusted: ${params.price} → ${adjustedPrice} (bestBid: ${book.bestBid})`);
-      }
-    }
+    // Maker enforcement: use caller's price directly (use postOnly for server-side enforcement)
+    adjustedPrice = params.price;
   }
 
   // Round to tick size

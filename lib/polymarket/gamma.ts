@@ -13,6 +13,7 @@ export async function fetchEvents(params?: {
   closed?: boolean;
   order?: string;
   ascending?: boolean;
+  slug?: string;
 }): Promise<GammaEvent[]> {
   const searchParams = new URLSearchParams();
   if (params?.limit) searchParams.set('limit', String(params.limit));
@@ -21,6 +22,7 @@ export async function fetchEvents(params?: {
   if (params?.closed !== undefined) searchParams.set('closed', String(params.closed));
   if (params?.order) searchParams.set('order', params.order);
   if (params?.ascending !== undefined) searchParams.set('ascending', String(params.ascending));
+  if (params?.slug) searchParams.set('slug', params.slug);
 
   const qs = searchParams.toString();
   const url = gammaUrl(`/events${qs ? `?${qs}` : ''}`);

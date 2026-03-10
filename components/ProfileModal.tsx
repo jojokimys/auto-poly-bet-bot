@@ -9,13 +9,9 @@ import {
   ModalFooter,
   Input,
   Button,
-  Checkbox,
-  CheckboxGroup,
-  Slider,
   Chip,
 } from '@heroui/react';
 import { useProfileStore, type ProfilePublic } from '@/store/useProfileStore';
-import { STRATEGY_META } from '@/lib/bot/strategy-meta';
 
 interface ProfileModalProps {
   isOpen: boolean;
@@ -40,19 +36,15 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
     builderApiKey: '',
     builderApiSecret: '',
     builderApiPassphrase: '',
-    enabledStrategies: ['value-betting'] as string[],
-    maxPortfolioExposure: 40, // percent
   });
 
   const [localError, setLocalError] = useState<string | null>(null);
   const [deriving, setDeriving] = useState(false);
   const [deriveSuccess, setDeriveSuccess] = useState<string | null>(null);
 
-  // Whether API keys exist (derived or pre-existing)
   const hasApiKeys = !!(form.apiKey && form.apiSecret && form.apiPassphrase);
   const apiKeysConfigured = hasApiKeys || (isEditMode && profile?.hasApiCredentials);
 
-  // Reset form when modal opens or profile changes
   useEffect(() => {
     if (isOpen) {
       clearMessages();
@@ -69,8 +61,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
           builderApiKey: '',
           builderApiSecret: '',
           builderApiPassphrase: '',
-          enabledStrategies: profile.enabledStrategies?.length ? profile.enabledStrategies : ['value-betting'],
-          maxPortfolioExposure: Math.round((profile.maxPortfolioExposure ?? 0.4) * 100),
         });
       } else {
         setForm({
@@ -83,8 +73,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
           builderApiKey: '',
           builderApiSecret: '',
           builderApiPassphrase: '',
-          enabledStrategies: ['value-betting'],
-          maxPortfolioExposure: 40,
         });
       }
     }
@@ -177,8 +165,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
       if (form.builderApiKey) data.builderApiKey = form.builderApiKey;
       if (form.builderApiSecret) data.builderApiSecret = form.builderApiSecret;
       if (form.builderApiPassphrase) data.builderApiPassphrase = form.builderApiPassphrase;
-      data.enabledStrategies = form.enabledStrategies;
-      data.maxPortfolioExposure = form.maxPortfolioExposure / 100;
       ok = await updateProfile(profile.id, data);
     } else {
       const data: Record<string, unknown> = {
@@ -187,8 +173,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
         apiKey: form.apiKey,
         apiSecret: form.apiSecret,
         apiPassphrase: form.apiPassphrase,
-        enabledStrategies: form.enabledStrategies,
-        maxPortfolioExposure: form.maxPortfolioExposure / 100,
       };
       if (form.funderAddress) data.funderAddress = form.funderAddress;
       if (form.builderApiKey) data.builderApiKey = form.builderApiKey;
@@ -213,9 +197,7 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             {isEditMode ? 'Edit Profile' : 'Add Profile'}
           </h3>
           <p className="text-sm text-gray-500 dark:text-gray-400 font-normal">
-            {isEditMode
-              ? 'Update profile credentials and strategy'
-              : 'Configure a new bot trading profile'}
+            {isEditMode ? 'Update profile credentials' : 'Configure a new trading profile'}
           </p>
         </ModalHeader>
 
@@ -229,7 +211,6 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             onValueChange={(v) => setForm((f) => ({ ...f, name: v }))}
           />
 
-          {/* Wallet + API Keys Section */}
           <div className="space-y-3">
             <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
               Wallet Configuration
@@ -241,11 +222,7 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
               variant="bordered"
               value={form.privateKey}
               onValueChange={(v) => setForm((f) => ({ ...f, privateKey: v }))}
-              description={
-                isEditMode
-                  ? 'Leave empty to keep existing key'
-                  : 'Your Polygon wallet private key'
-              }
+              description={isEditMode ? 'Leave empty to keep existing key' : 'Your Polygon wallet private key'}
             />
             <Input
               label="Funder Address"
@@ -259,11 +236,7 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="text-sm text-gray-700 dark:text-gray-300">API Credentials</span>
-                <Chip
-                  size="sm"
-                  variant="flat"
-                  color={apiKeysConfigured ? 'success' : 'warning'}
-                >
+                <Chip size="sm" variant="flat" color={apiKeysConfigured ? 'success' : 'warning'}>
                   {apiKeysConfigured ? 'Configured' : 'Not set'}
                 </Chip>
               </div>
@@ -279,12 +252,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
               </Button>
             </div>
 
-            {deriveSuccess && (
-              <p className="text-xs text-success">{deriveSuccess}</p>
-            )}
+            {deriveSuccess && <p className="text-xs text-success">{deriveSuccess}</p>}
           </div>
 
-          {/* Builder API Credentials Section */}
           <div className="space-y-3">
             <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
               Builder API Credentials
@@ -292,23 +262,9 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
                 <span className="ml-2 text-xs text-success">Configured</span>
               )}
             </p>
-            <p className="text-xs text-gray-500 dark:text-gray-400">
-              From{' '}
-              <a
-                href="https://polymarket.com/settings?tab=builder"
-                target="_blank"
-                rel="noreferrer"
-                className="text-primary underline"
-              >
-                builders.polymarket.com
-              </a>
-              {' '}— required for order placement
-            </p>
             <Input
               label="Builder API Key"
-              placeholder={
-                isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder API key'
-              }
+              placeholder={isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder API key'}
               variant="bordered"
               value={form.builderApiKey}
               onValueChange={(v) => setForm((f) => ({ ...f, builderApiKey: v }))}
@@ -316,9 +272,7 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             <Input
               type="password"
               label="Builder API Secret"
-              placeholder={
-                isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder secret'
-              }
+              placeholder={isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder secret'}
               variant="bordered"
               value={form.builderApiSecret}
               onValueChange={(v) => setForm((f) => ({ ...f, builderApiSecret: v }))}
@@ -326,74 +280,19 @@ export function ProfileModal({ isOpen, onClose, profile, onSaved }: ProfileModal
             <Input
               type="password"
               label="Builder API Passphrase"
-              placeholder={
-                isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder passphrase'
-              }
+              placeholder={isEditMode && profile?.hasBuilderCredentials ? '••••••••' : 'Enter builder passphrase'}
               variant="bordered"
               value={form.builderApiPassphrase}
               onValueChange={(v) => setForm((f) => ({ ...f, builderApiPassphrase: v }))}
             />
           </div>
 
-          {/* Portfolio Exposure Limit */}
-          <div className="space-y-2">
-            <Slider
-              label="Max Portfolio Exposure"
-              step={5}
-              minValue={10}
-              maxValue={100}
-              value={form.maxPortfolioExposure}
-              onChange={(v) =>
-                setForm((f) => ({ ...f, maxPortfolioExposure: v as number }))
-              }
-              getValue={(v) => `${v}%`}
-              className="max-w-full"
-              size="sm"
-            />
-            <p className="text-xs text-gray-500 dark:text-gray-400">
-              Maximum percentage of balance that can be used for open positions
-            </p>
-          </div>
-
-          <div className="space-y-2">
-            <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-              Enabled Strategies
-            </p>
-            <p className="text-xs text-gray-500 dark:text-gray-400">
-              Select one or more strategies for this profile to run
-            </p>
-            <CheckboxGroup
-              value={form.enabledStrategies}
-              onValueChange={(values) =>
-                setForm((f) => ({
-                  ...f,
-                  enabledStrategies: values.length > 0 ? values : ['value-betting'],
-                }))
-              }
-            >
-              {STRATEGY_META.map((s) => (
-                <Checkbox key={s.key} value={s.key} size="sm">
-                  <span className="text-sm">{s.label}</span>
-                  <span className="text-xs text-gray-500 dark:text-gray-400 ml-1.5">
-                    — {s.description}
-                  </span>
-                </Checkbox>
-              ))}
-            </CheckboxGroup>
-          </div>
-
-          {displayError && (
-            <p className="text-sm text-danger">{displayError}</p>
-          )}
-          {success && (
-            <p className="text-sm text-success">{success}</p>
-          )}
+          {displayError && <p className="text-sm text-danger">{displayError}</p>}
+          {success && <p className="text-sm text-success">{success}</p>}
         </ModalBody>
 
         <ModalFooter>
-          <Button variant="light" onPress={onClose}>
-            Cancel
-          </Button>
+          <Button variant="light" onPress={onClose}>Cancel</Button>
           <Button color="primary" onPress={handleSave} isLoading={saving}>
             {isEditMode ? 'Update Profile' : 'Create Profile'}
           </Button>

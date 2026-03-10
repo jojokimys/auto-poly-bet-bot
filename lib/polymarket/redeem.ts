@@ -96,7 +96,7 @@ export interface ClaimablePosition {
   conditionId: string;
   asset: string;
   oppositeAsset: string;
-  outcomeIndex: number;
+  outcomeIndex: number | null;
   negativeRisk: boolean;
   size: number;
   title: string;
@@ -117,7 +117,7 @@ export async function fetchClaimablePositions(walletAddress: string): Promise<Cl
       conditionId: p.conditionId,
       asset: p.asset,
       oppositeAsset: p.oppositeAsset,
-      outcomeIndex: p.outcomeIndex ?? 0,
+      outcomeIndex: typeof p.outcomeIndex === 'number' ? p.outcomeIndex : null,
       negativeRisk: p.negativeRisk ?? false,
       size: parseFloat(p.size) || 0,
       title: p.title ?? '',

@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/db/prisma';
-import { stopBot } from '@/lib/bot/skill-engine';
 import { clearProfileClient } from '@/lib/bot/profile-client';
 
 const updateProfileSchema = z.object({
@@ -167,13 +166,6 @@ export async function DELETE(
 
     if (!existing) {
       return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
-    }
-
-    // Stop the bot for this profile if it is running
-    try {
-      await stopBot(id);
-    } catch {
-      // Bot may not be running, that's fine
     }
 
     // Clear the cached client
