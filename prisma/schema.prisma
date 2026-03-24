@@ -8,22 +8,21 @@ datasource db {
 }
 
 model Market {
-  id          String   @id @default(cuid())
-  conditionId String   @unique
+  id          String           @id @default(cuid())
+  conditionId String           @unique
   question    String
   slug        String
   endDate     String
-  active      Boolean  @default(true)
-  closed      Boolean  @default(false)
-  liquidity   Float    @default(0)
-  volume      Float    @default(0)
+  active      Boolean          @default(true)
+  closed      Boolean          @default(false)
+  liquidity   Float            @default(0)
+  volume      Float            @default(0)
   image       String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  outcomes  Outcome[]
-  orders    Order[]
-  snapshots MarketSnapshot[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  snapshots   MarketSnapshot[]
+  orders      Order[]
+  outcomes    Outcome[]
 }
 
 model Outcome {
@@ -32,8 +31,7 @@ model Outcome {
   name     String
   tokenId  String
   price    Float  @default(0)
-
-  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
 
   @@unique([marketId, name])
 }
@@ -52,9 +50,8 @@ model Order {
   outcome     String
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
-
-  market Market  @relation(fields: [marketId], references: [id])
-  trades Trade[]
+  market      Market   @relation(fields: [marketId], references: [id])
+  trades      Trade[]
 }
 
 model Trade {
@@ -66,59 +63,55 @@ model Trade {
   fee        Float    @default(0)
   matchTime  DateTime
   createdAt  DateTime @default(now())
-
-  order Order @relation(fields: [orderId], references: [id])
+  order      Order    @relation(fields: [orderId], references: [id])
 }
 
 model MarketSnapshot {
-  id          String   @id @default(cuid())
-  marketId    String
-  yesPrice    Float
-  noPrice     Float
-  volume24hr  Float    @default(0)
-  spread      Float    @default(0)
-  liquidity   Float    @default(0)
-  snapshotAt  DateTime @default(now())
-
-  market Market @relation(fields: [marketId], references: [id])
+  id         String   @id @default(cuid())
+  marketId   String
+  yesPrice   Float
+  noPrice    Float
+  volume24hr Float    @default(0)
+  spread     Float    @default(0)
+  liquidity  Float    @default(0)
+  snapshotAt DateTime @default(now())
+  market     Market   @relation(fields: [marketId], references: [id])
 
   @@index([marketId, snapshotAt])
 }
 
 model BotProfile {
-  id                    String   @id @default(cuid())
-  name                  String
-  privateKey            String
-  funderAddress         String   @default("")
-  signatureType         Int      @default(2) // 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
-  apiKey                String
-  apiSecret             String
-  apiPassphrase         String
-  builderApiKey         String   @default("")
-  builderApiSecret      String   @default("")
-  builderApiPassphrase  String   @default("")
-  isActive              Boolean  @default(true)
-  enabledStrategies     String   @default("[\"value-betting\"]")
-  maxPortfolioExposure  Float    @default(0.4)
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  id                   String   @id @default(cuid())
+  name                 String
+  privateKey           String
+  funderAddress        String   @default("")
+  signatureType        Int      @default(2)
+  apiKey               String
+  apiSecret            String
+  apiPassphrase        String
+  builderApiKey        String   @default("")
+  builderApiSecret     String   @default("")
+  builderApiPassphrase String   @default("")
+  isActive             Boolean  @default(true)
+  enabledStrategies    String   @default("[\"value-betting\"]")
+  maxPortfolioExposure Float    @default(0.4)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 }
 
 model BotLog {
   id        String   @id @default(cuid())
-  profileId String?  // null for legacy / non-profile logs
-  level     String   // info, warn, error, trade
-  event     String   // scan, signal, order, risk, start, stop, error
+  level     String
+  event     String
   message   String
-  data      String?  // JSON blob for structured metadata
+  data      String?
   createdAt DateTime @default(now())
+  profileId String?
 
   @@index([createdAt])
   @@index([event])
   @@index([profileId])
 }
-
-// ─── AI Trading Team Models ─────────────────────────────
 
 model AiSession {
   id         String       @id @default(cuid())
@@ -134,24 +127,23 @@ model AiSession {
 }
 
 model AiDecision {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   sessionId   String
   profileId   String
-  type        String   // "trade" | "hold" | "exit" | "skip"
+  type        String
   conditionId String?
-  action      String?  // "BUY" | "SELL"
+  action      String?
   tokenId     String?
   outcome     String?
   price       Float?
   size        Float?
   reason      String
-  confidence  Int      // 0-100
-  strategy    String?  // strategy name (e.g. "value-betting")
-  result      String?  // "success" | "failed" | "pending"
+  confidence  Int
+  result      String?
   pnl         Float?
-  createdAt   DateTime @default(now())
-
-  session AiSession @relation(fields: [sessionId], references: [id])
+  createdAt   DateTime  @default(now())
+  strategy    String?
+  session     AiSession @relation(fields: [sessionId], references: [id])
 
   @@index([profileId, createdAt])
   @@index([sessionId])
@@ -160,7 +152,7 @@ model AiDecision {
 model AiLearning {
   id         String   @id @default(cuid())
   profileId  String
-  category   String   // "strategy" | "risk" | "market" | "execution"
+  category   String
   insight    String
   confidence Int
   source     String
@@ -168,4 +160,14 @@ model AiLearning {
   createdAt  DateTime @default(now())
 
   @@index([profileId, category])
+}
+
+model LpBlacklist {
+  id          String   @id @default(cuid())
+  conditionId String   @unique
+  slug        String
+  reason      String   @default("filled")
+  createdAt   DateTime @default(now())
+
+  @@index([conditionId])
 }

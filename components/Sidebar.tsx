@@ -25,6 +25,48 @@ const navItems: NavItem[] = [
     ),
   },
   {
+    name: 'LP Rewards',
+    href: '/lp',
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+        />
+      </svg>
+    ),
+  },
+  {
+    name: 'Reversal',
+    href: '/reversal',
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M9 8h1.5c1.5 0 2.5.5 2.5 2s-1 2-2.5 2H9m0-4V6m0 2v4m0 0h2c1.5 0 2.5.5 2.5 2s-1 2-2.5 2H9m0-4v4m0 0v2m0-14c-4.418 0-8 3.582-8 8s3.582 8 8 8 8-3.582 8-8-3.582-8-8-8z"
+        />
+      </svg>
+    ),
+  },
+  {
+    name: 'Bonding',
+    href: '/bonding',
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M13 10V3L4 14h7v7l9-11h-7z"
+        />
+      </svg>
+    ),
+  },
+  {
     name: 'Settings',
     href: '/settings',
     icon: (
@@ -50,22 +92,26 @@ export function Sidebar() {
   const pathname = usePathname();
 
   return (
-    <aside className="w-64 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 min-h-screen">
-      <nav className="p-4 space-y-2">
+    <aside className="w-14 flex-shrink-0 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
+      <nav className="flex flex-col items-center py-4 space-y-2">
         {navItems.map((item) => {
           const isActive = pathname === item.href;
           return (
             <Link
               key={item.href}
               href={item.href}
-              className={`flex items-center space-x-3 px-4 py-3 rounded-lg transition-colors ${
+              title={item.name}
+              className={`relative group flex items-center justify-center w-10 h-10 rounded-lg transition-colors ${
                 isActive
                   ? 'bg-blue-500 text-white'
                   : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
               }`}
             >
               {item.icon}
-              <span className="font-medium">{item.name}</span>
+              {/* Tooltip */}
+              <span className="absolute left-full ml-2 px-2 py-1 rounded bg-gray-900 text-white text-xs font-medium whitespace-nowrap opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity z-50">
+                {item.name}
+              </span>
             </Link>
           );
         })}

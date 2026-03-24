@@ -5,6 +5,9 @@
 
 # trade logs
 /logs
+
+# runtime data (positions, trades persist)
+/.data
 /.pnp
 .pnp.js
 

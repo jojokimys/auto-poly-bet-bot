@@ -17,6 +17,8 @@ export class PolymarketWS {
   private onBook: BookHandler | null = null;
   private onDisconnect: ConnectionHandler | null = null;
   private intentionalClose = false;
+  private pingMs: number | null = null;
+  private pingSentAt = 0;
 
   connect(assetIds: string[], onBook: BookHandler, onDisconnect?: ConnectionHandler): void {
     this.onBook = onBook;
@@ -51,6 +53,7 @@ export class PolymarketWS {
       this.stopHeartbeat();
       this.heartbeatTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
+          this.pingSentAt = Date.now();
           this.ws.send('PING');
         }
       }, HEARTBEAT_MS);
@@ -58,7 +61,13 @@ export class PolymarketWS {
 
     this.ws.on('message', (data) => {
       const msg = data.toString();
-      if (msg === 'PONG') return;
+      if (msg === 'PONG') {
+        if (this.pingSentAt > 0) {
+          this.pingMs = Date.now() - this.pingSentAt;
+          this.pingSentAt = 0;
+        }
+        return;
+      }
 
       try {
         const parsed = JSON.parse(msg);
@@ -69,17 +78,18 @@ export class PolymarketWS {
             buys: parsed.buys || [],
             sells: parsed.sells || [],
             timestamp: parsed.timestamp || Date.now(),
+            isFullBook: true,
           });
         } else if (parsed.event_type === 'price_change' && parsed.price_changes) {
-          // On price_change, we trigger a book-level update per affected asset
-          // The engine will use the latest best bid/ask from the change
+          // price_change only has best bid/ask, no depth — NOT usable for wall checks
           for (const change of parsed.price_changes) {
-            if (change.asset_id && change.best_bid && change.best_ask) {
+            if (change.asset_id) {
               this.onBook?.({
                 assetId: change.asset_id,
-                buys: [{ price: change.best_bid, size: '0' }],
-                sells: [{ price: change.best_ask, size: '0' }],
+                buys: change.best_bid ? [{ price: change.best_bid, size: '0' }] : [],
+                sells: change.best_ask ? [{ price: change.best_ask, size: '0' }] : [],
                 timestamp: parsed.timestamp || Date.now(),
+                isFullBook: false,
               });
             }
           }
@@ -140,6 +150,10 @@ export class PolymarketWS {
 
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  getPingMs(): number | null {
+    return this.pingMs;
   }
 
   private stopHeartbeat(): void {

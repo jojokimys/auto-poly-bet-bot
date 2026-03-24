@@ -182,6 +182,78 @@ export async function getProfileBalance(profile: ProfileCredentials): Promise<nu
   return parseFloat(result.balance) / 1e6;
 }
 
+/** Get token balance (position size) for a specific asset */
+export async function getProfileTokenBalance(
+  profile: ProfileCredentials,
+  tokenId: string,
+): Promise<number> {
+  trackClobAuthCall();
+  const client = getClientForProfile(profile);
+  const result = await withRetry(() =>
+    client.getBalanceAllowance({ asset_type: 'CONDITIONAL' as any, token_id: tokenId } as any),
+  );
+  // Balance is in raw units (6 decimals for USDC-backed tokens)
+  return parseFloat(result.balance) / 1e6;
+}
+
+/** Get all open positions from Polymarket Data API */
+export interface UserPosition {
+  asset: string;
+  conditionId: string;
+  size: number;
+  avgPrice: number;
+  initialValue: number;
+  currentValue: number;
+  curPrice: number;
+  cashPnl: number;
+  percentPnl: number;
+  realizedPnl: number;
+  title: string;
+  slug: string;
+  outcome: string;
+  outcomeIndex: number;
+  oppositeAsset: string;
+  endDate: string;
+  negativeRisk: boolean;
+  redeemable: boolean;
+  mergeable: boolean;
+}
+
+export async function getProfilePositions(profile: ProfileCredentials): Promise<UserPosition[]> {
+  const wallet = profile.funderAddress;
+  if (!wallet) return [];
+  const res = await fetch(
+    `https://data-api.polymarket.com/positions?user=${wallet}&sizeThreshold=0&limit=500`,
+    { cache: 'no-store' },
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  if (!Array.isArray(data)) return [];
+  return data
+    .filter((p: any) => parseFloat(p.size) > 0)
+    .map((p: any) => ({
+      asset: p.asset,
+      conditionId: p.conditionId,
+      size: parseFloat(p.size) || 0,
+      avgPrice: parseFloat(p.avgPrice) || 0,
+      initialValue: parseFloat(p.initialValue) || 0,
+      currentValue: parseFloat(p.currentValue) || 0,
+      curPrice: parseFloat(p.curPrice) || 0,
+      cashPnl: parseFloat(p.cashPnl) || 0,
+      percentPnl: parseFloat(p.percentPnl) || 0,
+      realizedPnl: parseFloat(p.realizedPnl) || 0,
+      title: p.title ?? '',
+      slug: p.slug ?? '',
+      outcome: p.outcome ?? '',
+      outcomeIndex: typeof p.outcomeIndex === 'number' ? p.outcomeIndex : 0,
+      oppositeAsset: p.oppositeAsset ?? '',
+      endDate: p.endDate ?? '',
+      negativeRisk: p.negativeRisk ?? false,
+      redeemable: p.redeemable ?? false,
+      mergeable: p.mergeable ?? false,
+    }));
+}
+
 /** Get trades for a specific profile */
 export async function getProfileTrades(profile: ProfileCredentials) {
   trackClobAuthCall();

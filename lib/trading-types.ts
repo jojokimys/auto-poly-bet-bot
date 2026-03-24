@@ -14,4 +14,6 @@ export interface BookSnapshot {
   buys: BookLevel[];
   sells: BookLevel[];
   timestamp: number;
+  /** true for full orderbook snapshots, false for price_change (best bid/ask only) */
+  isFullBook?: boolean;
 }

@@ -60,6 +60,8 @@ export class RtdsWS {
   private priceHistory: Map<CryptoAsset, SpotPriceEntry[]> = new Map();
   private onPrice: PriceHandler | null = null;
   private lastDataAt = 0;
+  private pingMs: number | null = null;
+  private pingSentAt = 0;
 
   connect(onPrice?: PriceHandler): void {
     this.onPrice = onPrice ?? null;
@@ -108,6 +110,10 @@ export class RtdsWS {
     // Handle WebSocket-level pong (response to ws.ping())
     this.ws.on('pong', () => {
       this.clearPongTimer();
+      if (this.pingSentAt > 0) {
+        this.pingMs = Date.now() - this.pingSentAt;
+        this.pingSentAt = 0;
+      }
     });
 
     this.ws.on('message', (data) => {
@@ -165,6 +171,7 @@ export class RtdsWS {
 
     // Send both WebSocket-level ping AND text PING
     try {
+      this.pingSentAt = Date.now();
       this.ws.ping();
       this.ws.send('PING');
     } catch {
@@ -279,7 +286,7 @@ export class RtdsWS {
    */
   oraclesAgree(asset: CryptoAsset, strike: number, spotPrice: number): boolean {
     const chainlink = this.getChainlinkPrice(asset);
-    if (!chainlink) return false;     // no Chainlink data = block entry (settlement uses Chainlink)
+    if (!chainlink) return true;      // no Chainlink data = allow entry (rely on Binance/Coinbase)
     // If Chainlink is within 0.05% of strike, it's too close to disagree meaningfully
     const chainlinkDiffPct = Math.abs(chainlink - strike) / strike;
     if (chainlinkDiffPct < 0.0005) return true;  // trust Binance alone
@@ -313,6 +320,10 @@ export class RtdsWS {
 
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  getPingMs(): number | null {
+    return this.pingMs;
   }
 
   disconnect(): void {
