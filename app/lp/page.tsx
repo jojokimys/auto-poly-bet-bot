@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Chip, Spinner, Select, SelectItem } from '@heroui/react';
 import { useProfileStore } from '@/store/useProfileStore';
+import { DepthGrid, WallBar } from '@/components/DepthGrid';
 
 interface MarketRow {
   id: string;
@@ -81,6 +82,8 @@ interface EngineMarket {
   wallYes: number;
   wallNo: number;
   rewardsMaxSpread: number;
+  depthYes?: Array<{ price: number; size: number; isMyOrder: boolean }>;
+  depthNo?: Array<{ price: number; size: number; isMyOrder: boolean }>;
 }
 
 interface EngineStatus {
@@ -96,6 +99,7 @@ interface EngineStatus {
   totalEstDailyReward: number;
   lastScanTime?: number;
   markets: EngineMarket[];
+  dailyEarnings?: { earnings: any; totalEarnings: any; marketsConfig: any; fetchedAt: number };
 }
 
 interface LogLine {
@@ -411,10 +415,9 @@ export default function LpRewardsPage() {
                             </span>
                           ) : <span className="text-gray-600">—</span>}
                         </td>
-                        <td className="px-2 py-1.5 text-right font-mono">
-                          {m.wallYes != null ? (
-                            <span className="text-green-400">${Math.round(Math.min(m.wallYes, m.wallNo ?? m.wallYes))}</span>
-                          ) : '—'}
+                        <td className="px-2 py-1.5">
+                          <WallBar label="Y" mid={m.midpoint} wallSize={m.wallYes ?? 0} maxSpread={m.rewardsMaxSpread} />
+                          <WallBar label="N" mid={1 - m.midpoint} wallSize={m.wallNo ?? 0} maxSpread={m.rewardsMaxSpread} />
                         </td>
                         <td className="px-2 py-1.5 text-right font-mono text-yellow-400">
                           {(m.rewardsDailyRate ?? 0) > 0 ? `$${m.rewardsDailyRate!.toFixed(0)}` : '—'}
@@ -517,6 +520,13 @@ export default function LpRewardsPage() {
                   <span className="text-green-400 font-mono">
                     est +${engineStatus.totalEstDailyReward.toFixed(2)}/day
                   </span>
+                  {engineStatus.dailyEarnings?.totalEarnings != null && (
+                    <span className="text-purple-400 font-mono">
+                      earned ${typeof engineStatus.dailyEarnings.totalEarnings === 'number'
+                        ? `$${engineStatus.dailyEarnings.totalEarnings.toFixed(2)}`
+                        : `$${parseFloat(engineStatus.dailyEarnings.totalEarnings?.amount ?? engineStatus.dailyEarnings.totalEarnings ?? '0').toFixed(2)}`}
+                    </span>
+                  )}
                 </div>
               )}
               <span className="text-[10px] text-gray-400 ml-auto">
@@ -532,13 +542,9 @@ export default function LpRewardsPage() {
                     <tr className="text-left text-gray-500">
                       <th className="px-2 py-1.5 font-medium">#</th>
                       <th className="px-2 py-1.5 font-medium min-w-[200px]">Market</th>
-                      <th className="px-2 py-1.5 font-medium text-right">Alloc$</th>
-                      <th className="px-2 py-1.5 font-medium text-right">Deployed</th>
                       <th className="px-2 py-1.5 font-medium text-right">Orders</th>
                       <th className="px-2 py-1.5 font-medium text-right">Rate</th>
-                      <th className="px-2 py-1.5 font-medium text-right">Est/day</th>
-                      <th className="px-2 py-1.5 font-medium min-w-[280px]">Orderbook</th>
-                      <th className="px-2 py-1.5 font-medium text-right">Expiry</th>
+                      <th className="px-2 py-1.5 font-medium text-center">Orderbook</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -647,119 +653,17 @@ function EngineMarketRow({ market: m, index: i }: { market: EngineMarket; index:
           {m.question}
         </a>
       </td>
-      <td className="px-2 py-1.5 text-right font-mono">${m.allocatedCapital.toFixed(0)}</td>
-      <td className="px-2 py-1.5 text-right font-mono text-blue-400">${m.lpDeployed.toFixed(0)}</td>
       <td className="px-2 py-1.5 text-right font-mono">{m.activeOrders}</td>
       <td className="px-2 py-1.5 text-right font-mono text-yellow-400">${m.rewardsDailyRate.toFixed(0)}</td>
-      <td className="px-2 py-1.5 text-right font-mono">
-        <FlashValue value={m.estDailyReward} format={(v) => `+$${v.toFixed(3)}`} className="text-green-400" />
+      <td className="px-2 py-1.5 text-center">
+        <div className="flex justify-center">
+          <DepthGrid mid={m.midpoint} depthYes={m.depthYes ?? []} depthNo={m.depthNo ?? []} wallYes={m.wallYes} wallNo={m.wallNo} maxSpread={m.rewardsMaxSpread} />
+        </div>
       </td>
-      <td className="px-2 py-1.5">
-        <DepthBar label="Y" liveBid={m.liveBidYes} myBid={m.myBidYes} mid={m.midpoint} wall={m.wallYes} maxSpread={m.rewardsMaxSpread} />
-        <DepthBar label="N" liveBid={m.liveBidNo} myBid={m.myBidNo} mid={1 - m.midpoint} wall={m.wallNo} maxSpread={m.rewardsMaxSpread} />
-      </td>
-      <td className="px-2 py-1.5 text-right font-mono text-gray-400">{(m.daysToExpiry ?? 0).toFixed(0)}d</td>
     </tr>
   );
 }
 
-/**
- * Orderbook depth visualization per side.
- * Shows: live bid price, my bid price, distance gap, wall size with color coding.
- */
-function DepthBar({ label, liveBid, myBid, mid, wall, maxSpread }: {
-  label: string;
-  liveBid: number;
-  myBid: number;
-  mid: number;
-  wall: number;
-  maxSpread: number;
-}) {
-  if (mid <= 0) return <div className="h-5" />;
-
-  const edgePrice = Math.max(0.01, mid - maxSpread / 100);
-  const range = mid - edgePrice;
-  if (range <= 0) return <div className="h-5" />;
-
-  const myPos = myBid > 0 ? Math.min(100, Math.max(0, ((myBid - edgePrice) / range) * 100)) : -1;
-  const livePos = liveBid > 0 ? Math.min(100, Math.max(0, ((liveBid - edgePrice) / range) * 100)) : -1;
-  const distCents = myBid > 0 ? ((mid - myBid) * 100).toFixed(1) : '?';
-
-  // Wall color by safety level
-  const wallColor = wall > 5000 ? 'bg-green-500/40' : wall > 2000 ? 'bg-green-500/25' : wall > 500 ? 'bg-yellow-500/25' : wall > 0 ? 'bg-red-500/20' : 'bg-gray-700/30';
-  const wallTextColor = wall > 5000 ? 'text-green-400' : wall > 2000 ? 'text-green-500' : wall > 500 ? 'text-yellow-400' : wall > 0 ? 'text-red-400' : 'text-gray-600';
-  const wallLeft = myPos >= 0 ? myPos : 0;
-  const wallWidth = livePos >= 0 && myPos >= 0 ? Math.max(0, livePos - myPos) : 0;
-
-  const isYes = label === 'Y';
-
-  return (
-    <div className="flex items-center gap-1.5 h-5">
-      {/* Side label */}
-      <span className={`text-[10px] font-bold w-3 ${isYes ? 'text-blue-400' : 'text-red-400'}`}>{label}</span>
-
-      {/* Depth bar */}
-      <div className="relative flex-1 h-4 bg-gray-800/80 rounded overflow-hidden cursor-help group"
-        title={`Mid: ${mid.toFixed(2)} | Live: ${liveBid.toFixed(2)} | My: ${myBid.toFixed(2)} | Wall: $${wall.toFixed(0)} | Dist: ${distCents}¢`}>
-
-        {/* Reward zone */}
-        <div className="absolute inset-0 bg-gray-700/30 rounded" />
-
-        {/* Wall fill */}
-        {wallWidth > 0 && (
-          <div className={`absolute top-0 bottom-0 ${wallColor} rounded transition-all duration-300`}
-            style={{ left: `${wallLeft}%`, width: `${wallWidth}%` }}
-          />
-        )}
-
-        {/* My bid marker */}
-        {myPos >= 0 && (
-          <>
-            <div className={`absolute top-0 bottom-0 w-[3px] ${isYes ? 'bg-blue-400' : 'bg-red-400'} z-20 rounded-full shadow-[0_0_4px_rgba(96,165,250,0.6)]`}
-              style={{ left: `${myPos}%` }}
-            />
-            <div className={`absolute top-[-1px] text-[8px] font-mono font-bold ${isYes ? 'text-blue-300' : 'text-red-300'} z-20`}
-              style={{ left: `${Math.min(myPos + 1, 85)}%` }}>
-              {myBid.toFixed(2)}
-            </div>
-          </>
-        )}
-
-        {/* Live bid marker */}
-        {livePos >= 0 && (
-          <>
-            <div className="absolute top-0 bottom-0 w-[2px] bg-white/70 z-10"
-              style={{ left: `${livePos}%` }}
-            />
-            <div className="absolute bottom-[-1px] text-[7px] font-mono text-white/50 z-10"
-              style={{ left: `${Math.min(livePos + 1, 85)}%` }}>
-              {liveBid.toFixed(2)}
-            </div>
-          </>
-        )}
-
-        {/* Mid marker */}
-        <div className="absolute top-0 bottom-0 w-[2px] bg-white/20 right-0" />
-        <div className="absolute top-0 right-1 text-[7px] text-white/30">{mid.toFixed(2)}</div>
-      </div>
-
-      {/* Distance from mid */}
-      <span className={`text-[10px] font-mono w-7 text-right ${
-        parseFloat(distCents) <= 1.5 ? 'text-green-400' : parseFloat(distCents) <= 3 ? 'text-yellow-400' : 'text-gray-500'
-      }`}>
-        {myBid > 0 ? <FlashValue value={parseFloat(distCents)} format={(v) => `${v.toFixed(1)}¢`} className="" /> : '—'}
-      </span>
-
-      {/* Wall size */}
-      <span className={`text-[10px] font-mono w-12 text-right font-semibold ${wallTextColor}`}
-        title={`Wall: $${wall.toFixed(0)}`}>
-        {wall > 0 ? (
-          <FlashValue value={wall} format={(v) => `$${formatCompact(v)}`} className="" />
-        ) : <span className="text-gray-600">no wall</span>}
-      </span>
-    </div>
-  );
-}
 
 function formatCompact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;

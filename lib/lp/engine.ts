@@ -40,9 +40,8 @@ import {
   type ProfileCredentials,
 } from '@/lib/bot/profile-client';
 import { getReadClient } from '@/lib/polymarket/client';
-import { PolymarketWS } from '@/lib/polymarket-ws';
 import { PolymarketUserWS, type UserTrade } from '@/lib/polymarket-user-ws';
-import type { BookSnapshot, BookLevel } from '@/lib/trading-types';
+import type { BookLevel } from '@/lib/trading-types';
 import { prisma } from '@/lib/db/prisma';
 
 // ─── Types ───────────────────────────────────────────────
@@ -102,6 +101,8 @@ export interface LpEngineStatus {
   totalEstDailyReward: number;
   lastScanTime?: number;
   markets: ManagedMarketStatus[];
+  /** Cached daily earnings from CLOB API */
+  dailyEarnings?: { earnings: any; totalEarnings: any; marketsConfig: any; fetchedAt: number };
 }
 
 export interface ManagedMarketStatus {
@@ -142,6 +143,9 @@ export interface ManagedMarketStatus {
   /** Wall size ($) above our order */
   wallYes: number;
   wallNo: number;
+  /** Depth data per price level for visualization: { price, size$ } from mid outward */
+  depthYes: Array<{ price: number; size: number; isMyOrder: boolean }>;
+  depthNo: Array<{ price: number; size: number; isMyOrder: boolean }>;
 }
 
 // ─── Constants ───────────────────────────────────────────
@@ -150,7 +154,7 @@ const MAX_LOGS = 500;
 const SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const REQUOTE_INTERVAL_MS = 30 * 1000;
 const TIGHT_REQUOTE_INTERVAL_MS = 60 * 1000; // 1min refresh for tight-spread markets
-const FILL_CHECK_INTERVAL_MS = 10 * 1000;
+const CLOB_SYNC_INTERVAL_MS = 30 * 1000;
 
 // ─── Risk Management Constants (from research) ──────────
 const MIN_DAYS_TO_EXPIRY = 2 / 24;  // Skip markets resolving within 2h
@@ -162,13 +166,13 @@ const INVENTORY_WARN_PCT = 0.30;    // Start skewing at 30% inventory imbalance
 const INVENTORY_MAX_PCT = 0.50;     // Pull quotes at 50% inventory imbalance
 const MIN_MIDPOINT = 0.10;          // Skip extreme probability markets
 const MAX_MIDPOINT = 0.90;
-const DEFAULT_MIN_WALL_SIZE = 300;  // Absolute minimum $ wall (fallback)
+const DEFAULT_MIN_WALL_SIZE = 3000; // Absolute minimum $ wall
 const WALL_MULTIPLIER = 3;          // Wall must be >= 3x our order size per side
 const MIN_LIQUIDITY = 10_000;       // Skip markets with < $10K liquidity
 const HEDGE_TIMEOUT_MS = 60_000;    // Force market-sell hedge after 60s
 // Wall-protected price must be within this fraction of the market's rewardsMaxSpread
 // e.g., 0.8 = must be within 80% of maxSpread (outer 20% is too low Q-score)
-const MAX_SPREAD_RATIO = 0.80;
+const MAX_SPREAD_RATIO = 1.00;
 
 class LpRewardsEngine {
   private running = false;
@@ -181,13 +185,11 @@ class LpRewardsEngine {
   /** Fill rounds per conditionId — blacklist after 2 rounds. Each round = one requote cycle with fills. */
   private fillRounds = new Map<string, { count: number; lastRoundAt: number }>();
   private scanTimer: ReturnType<typeof setInterval> | null = null;
-  private requoteTimer: ReturnType<typeof setInterval> | null = null;
-  private tightRequoteTimer: ReturnType<typeof setInterval> | null = null;
   private fillCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private wallPollTimer: ReturnType<typeof setInterval> | null = null;
   private lastScanTime = 0;
 
-  // ── Real-time WebSockets ──
-  private ws: PolymarketWS | null = null;
+  // ── Real-time WebSockets (User WS only — orderbook via REST polling) ──
   private userWs: PolymarketUserWS | null = null;
   /** assetId → { bids (sorted high→low), asks (sorted low→high), updated } */
   private liveBooks = new Map<string, {
@@ -195,6 +197,14 @@ class LpRewardsEngine {
     asks: BookLevel[];
     updated: number;
   }>();
+  /** Cached CLOB open orders — refreshed by syncWithClob */
+  private clobOpenOrders: Map<string, any[]> = new Map(); // tokenId → orders[]
+  /** Last time each market's wall was checked — for cooldown */
+  private lastWallCheck = new Map<string, number>(); // marketId → timestamp
+  private lastRequoteTime = 0;
+  private lastBalanceRefresh = 0;
+  /** Cached daily earnings data */
+  private cachedEarnings: { earnings: any; totalEarnings: any; marketsConfig: any; fetchedAt: number } | null = null;
 
   private config = {
     maxMarkets: 50,
@@ -218,6 +228,24 @@ class LpRewardsEngine {
   };
 
   isRunning() { return this.running; }
+
+  /** Fetch daily earnings from CLOB API and cache */
+  async fetchEarnings() {
+    if (!this.profile) return;
+    try {
+      const client = getClientForProfile(this.profile);
+      const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+      const [earnings, totalEarnings, marketsConfig] = await Promise.all([
+        client.getEarningsForUserForDay(today),
+        client.getTotalEarningsForUserForDay(today),
+        client.getUserEarningsAndMarketsConfig(today),
+      ]);
+      this.cachedEarnings = { earnings, totalEarnings, marketsConfig, fetchedAt: Date.now() };
+      this.log('reward', `Daily earnings fetched: ${JSON.stringify(totalEarnings)}`);
+    } catch (err: any) {
+      this.log('error', `Failed to fetch earnings: ${err.message}`);
+    }
+  }
 
   getStatus(): LpEngineStatus {
     const markets: ManagedMarketStatus[] = [];
@@ -290,6 +318,8 @@ class LpRewardsEngine {
             return p > myPrice ? sum + p * s : sum;
           }, 0);
         })(),
+        depthYes: this.getDepthLevels(mm, 0),
+        depthNo: this.getDepthLevels(mm, 1),
       });
     }
 
@@ -306,6 +336,7 @@ class LpRewardsEngine {
       totalEstDailyReward: markets.reduce((s, m) => s + m.estDailyReward, 0),
       lastScanTime: this.lastScanTime,
       markets: markets.sort((a, b) => b.roiAtMin - a.roiAtMin),
+      dailyEarnings: this.cachedEarnings ?? undefined,
     };
   }
 
@@ -344,14 +375,7 @@ class LpRewardsEngine {
       this.log('error', `Balance fetch failed: ${err.message}`);
     }
 
-    // 0. Approve COLLATERAL (USDC for BUY) — CONDITIONAL approved per-token at sell time
-    try {
-      const client = getClientForProfile(profile);
-      await client.updateBalanceAllowance({ asset_type: 'COLLATERAL' as any });
-      this.log('info', 'COLLATERAL allowance approved');
-    } catch (err: any) {
-      this.log('error', `Allowance approval failed: ${err.message}`);
-    }
+
 
     // 0b. Connect user WS for real-time fill detection
     if (profile.apiKey && profile.apiSecret && profile.apiPassphrase) {
@@ -364,49 +388,35 @@ class LpRewardsEngine {
 
     // 1. Scan markets first (populates managedMarkets but skips requote)
     await this.scanAndAllocate(true);
-    // 2. Connect WS for real-time orderbooks
-    this.connectWS();
-    // 3. Sync existing orders (now managedMarkets exist to match against)
-    await this.syncExistingOrders();
-    // 4. Sync existing positions (token balances → inventory + hedge orders)
+    // 2. Sync with CLOB: cancel orphan orders, reconcile state
+    await this.syncWithClob();
+    // 3. Sync existing positions (token balances → sell orphans)
     await this.syncExistingPositions();
-    // 5. Wait briefly for WS books to populate, then place orders
-    await new Promise((r) => setTimeout(r, 2000));
-    await this.requoteAll();
 
     this.scanTimer = setInterval(() => this.scanAndAllocate(), SCAN_INTERVAL_MS);
-    this.requoteTimer = setInterval(() => this.requoteAll(), REQUOTE_INTERVAL_MS);
-    this.tightRequoteTimer = setInterval(() => this.requoteTightMarkets(), TIGHT_REQUOTE_INTERVAL_MS);
-    this.fillCheckTimer = setInterval(() => this.checkFills(), FILL_CHECK_INTERVAL_MS);
+    this.fillCheckTimer = setInterval(() => this.clobSync(), CLOB_SYNC_INTERVAL_MS);
+    // P2: REST polling for wall monitoring (replaces WS orderbook)
+    this.wallPollLoop();
+    this.log('info', 'REST wall polling started (replaces WS orderbook)');
   }
 
   async stop() {
     this.running = false;
     if (this.scanTimer) clearInterval(this.scanTimer);
-    if (this.requoteTimer) clearInterval(this.requoteTimer);
-    if (this.tightRequoteTimer) clearInterval(this.tightRequoteTimer);
     if (this.fillCheckTimer) clearInterval(this.fillCheckTimer);
+    if (this.wallPollTimer) clearInterval(this.wallPollTimer);
     this.scanTimer = null;
-    this.requoteTimer = null;
-    this.tightRequoteTimer = null;
     this.fillCheckTimer = null;
+    this.wallPollTimer = null;
 
-    // Clear urgent timers
-    for (const timer of this.wsUrgentTimers.values()) clearTimeout(timer);
-    this.wsUrgentTimers.clear();
-    for (const timer of this.priceCheckTimers.values()) clearTimeout(timer);
-    this.priceCheckTimers.clear();
-
-    // Disconnect WS
+    // Disconnect User WS
     if (this.userWs) {
       this.userWs.disconnect();
       this.userWs = null;
     }
-    if (this.ws) {
-      this.ws.disconnect();
-      this.ws = null;
-    }
     this.liveBooks.clear();
+    this.clobOpenOrders.clear();
+    this.lastWallCheck.clear();
 
     if (this.profile) {
       try {
@@ -432,48 +442,298 @@ class LpRewardsEngine {
     addedAt: number;
   }> = [];
 
-  // ── WebSocket Orderbook ────────────────────────────────
-
-  private wsRequoteInFlight = false;
-  private wsUrgentTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Track asset IDs already fully hedged by WS to avoid double-selling in checkFills */
   private wsHedgedAssets = new Map<string, number>(); // assetId → cumulative hedged size
 
-  private connectWS() {
-    if (this.ws) {
-      this.ws.disconnect();
-    }
+  // ── P2: REST Polling for Wall Monitoring ───────────────
 
-    this.ws = new PolymarketWS();
-    this.ws.connect([], (book: BookSnapshot) => {
-      if (book.isFullBook) {
-        // Full orderbook snapshot — update depth cache + wall monitoring
-        this.liveBooks.set(book.assetId, {
-          bids: book.buys,
-          asks: book.sells,
-          updated: book.timestamp,
+  private static readonly WALL_POLL_ACTIVE_MS = 3_000;   // 3s for markets with LP orders
+  private static readonly WALL_POLL_IDLE_MS = 30_000;    // 30s for markets without orders
+  private static readonly BATCH_SIZE = 10;                // parallel REST fetch batch size
+
+  private marketProcessing = new Set<string>(); // per-market lock
+
+  /**
+   * Main REST polling loop — replaces WS orderbook monitoring.
+   * Fetches orderbooks in parallel batches, checks walls, cancels if unsafe.
+   */
+  private wallPollLoop() {
+    const poll = async () => {
+      if (!this.running || !this.profile) return;
+      const start = Date.now();
+
+      // Refresh balance every 30s
+      if (Date.now() - this.lastBalanceRefresh > 30_000) {
+        this.lastBalanceRefresh = Date.now();
+        try { this.balance = await getProfileBalance(this.profile); } catch { /* keep last */ }
+      }
+
+      try {
+        // Separate markets by priority
+        const active: ManagedMarket[] = [];
+        const idle: ManagedMarket[] = [];
+        const now = Date.now();
+
+        for (const [, mm] of this.managedMarkets) {
+          const hasOrders = mm.orders.some((o) => o.purpose === 'lp');
+          const lastCheck = this.lastWallCheck.get(mm.market.id) ?? 0;
+          const cooldown = hasOrders ? LpRewardsEngine.WALL_POLL_ACTIVE_MS : LpRewardsEngine.WALL_POLL_IDLE_MS;
+          if (now - lastCheck >= cooldown) {
+            if (hasOrders) active.push(mm);
+            else idle.push(mm);
+          }
+        }
+
+        // Active markets first (wall monitoring), then idle (opportunity scan)
+        const toCheck = [...active, ...idle.slice(0, 5)]; // limit idle per cycle
+        if (toCheck.length === 0) return;
+
+        // Batch fetch all orderbooks in parallel
+        const tokenIds = toCheck.flatMap((mm) => mm.market.clobTokenIds);
+        const books = new Map<string, { bids: BookLevel[]; asks: BookLevel[] }>();
+        const client = getReadClient();
+
+        for (let i = 0; i < tokenIds.length; i += LpRewardsEngine.BATCH_SIZE) {
+          const batch = tokenIds.slice(i, i + LpRewardsEngine.BATCH_SIZE);
+          const results = await Promise.allSettled(
+            batch.map(async (tid) => {
+              const book = await client.getOrderBook(tid);
+              const bids = (book.bids ?? []).sort((a: BookLevel, b: BookLevel) => parseFloat(b.price) - parseFloat(a.price));
+              const asks = (book.asks ?? []).sort((a: BookLevel, b: BookLevel) => parseFloat(a.price) - parseFloat(b.price));
+              return { tid, bids, asks };
+            }),
+          );
+          for (const r of results) {
+            if (r.status === 'fulfilled') {
+              books.set(r.value.tid, { bids: r.value.bids, asks: r.value.asks });
+              this.liveBooks.set(r.value.tid, { bids: r.value.bids, asks: r.value.asks, updated: Date.now() });
+            }
+          }
+        }
+
+        // Check walls + price for active markets — parallel batches
+        const processMarket = async (mm: ManagedMarket) => {
+          if (this.marketProcessing.has(mm.market.id)) return; // skip if still processing
+          this.marketProcessing.add(mm.market.id);
+          try {
+            this.lastWallCheck.set(mm.market.id, Date.now());
+            const yesBook = books.get(mm.market.clobTokenIds[0]);
+            const noBook = books.get(mm.market.clobTokenIds[1]);
+
+            let needsRequote = false;
+            if (yesBook) {
+              const result = await this.checkWallAndAct(mm, 0, yesBook.bids);
+              if (result === 'requote') needsRequote = true;
+            }
+            if (noBook) {
+              const result = await this.checkWallAndAct(mm, 1, noBook.bids);
+              if (result === 'requote') needsRequote = true;
+            }
+            if (needsRequote) {
+              await this.requoteMarket(mm);
+            }
+          } finally {
+            this.marketProcessing.delete(mm.market.id);
+          }
+        };
+
+        // Active markets: fire-and-forget with stagger, per-market lock prevents overlap
+        active.forEach((mm, idx) => {
+          setTimeout(() => processMarket(mm), idx * 50);
         });
 
-        // Real-time wall monitoring: only on full book (has depth data)
-        if (this.running && !this.wsRequoteInFlight) {
-          this.onWsBookUpdate(book.assetId, book.buys);
-        }
-      } else {
-        // price_change — only best bid/ask, no depth for wall checks
-        // Detect if best bid moved near/below our LP order → fetch full book for wall check
-        const existing = this.liveBooks.get(book.assetId);
-        if (existing) {
-          existing.updated = book.timestamp;
+        // Idle markets: fire-and-forget with stagger
+        const idleDue = idle.filter((mm) => Date.now() - mm.lastUpdate > REQUOTE_INTERVAL_MS).slice(0, 5);
+        if (idleDue.length > 0) {
+          idleDue.forEach((mm, idx) => {
+            this.lastWallCheck.set(mm.market.id, Date.now());
+            setTimeout(() => {
+              this.requoteMarket(mm).catch(() => {});
+            }, idx * 50);
+          });
         }
 
-        if (this.running && !this.wsRequoteInFlight && book.buys.length > 0) {
-          const newBestBid = parseFloat(book.buys[0].price);
-          this.checkPriceChangeWall(book.assetId, newBestBid);
-        }
+      } catch (err: any) {
+        this.log('error', `Wall poll error: ${err.message}`);
       }
-    });
 
-    this.log('info', 'WS connected (real-time wall monitoring active)');
+      // Schedule next cycle — fixed interval, pollInProgress prevents overlap
+      if (this.running) {
+        this.wallPollTimer = setTimeout(() => poll(), LpRewardsEngine.WALL_POLL_ACTIVE_MS) as any;
+      }
+    };
+
+    poll();
+  }
+
+  /**
+   * Check if the wall protecting our LP order on a given side has collapsed.
+   * If so, immediately cancel the LP order.
+   */
+  /** Track previous wall state for change logging */
+  private prevWallState = new Map<string, { wall: number; price: number }>();
+
+  /**
+   * Check wall health + price position for a given side.
+   * Returns 'collapsed' if wall gone, 'requote' if price shifted, 'ok' if unchanged.
+   */
+  private async checkWallAndAct(mm: ManagedMarket, tokenIndex: number, bids: BookLevel[]): Promise<'collapsed' | 'requote' | 'ok'> {
+    const lpOrders = mm.orders.filter((o) => o.purpose === 'lp' && o.tokenIndex === tokenIndex);
+    if (lpOrders.length === 0) return 'ok';
+
+    const side = tokenIndex === 0 ? 'Yes' : 'No';
+    const highestLpPrice = Math.max(...lpOrders.map((o) => o.price));
+
+    // Calculate wall above our order
+    let wallAbove = 0;
+    let wallTopPrice = 0;
+    for (const bid of bids) {
+      const bidPrice = parseFloat(bid.price);
+      const bidSize = parseFloat(bid.size);
+      if (bidPrice > highestLpPrice && bidSize > 0) {
+        wallAbove += bidPrice * bidSize;
+        if (bidPrice > wallTopPrice) wallTopPrice = bidPrice;
+      }
+    }
+
+    const myOrderCost = lpOrders.reduce((s, o) => s + o.price * o.size, 0);
+    const dangerThreshold = Math.max(this.config.minWallSize, myOrderCost * WALL_MULTIPLIER) * 0.5;
+
+    // Log wall changes
+    const stateKey = `${mm.market.id}-${tokenIndex}`;
+    const prev = this.prevWallState.get(stateKey);
+    const wallChanged = prev && (
+      Math.abs(prev.wall - wallAbove) > prev.wall * 0.2 ||
+      Math.abs(prev.price - wallTopPrice) >= 0.01
+    );
+    if (wallChanged) {
+      const dir = wallAbove > prev!.wall ? '↑' : '↓';
+      this.log('info', `WALL ${dir}: ${mm.market.slug} ${side} $${prev!.wall.toFixed(0)}→$${wallAbove.toFixed(0)} (order@${highestLpPrice.toFixed(2)}, threshold=$${dangerThreshold.toFixed(0)})`);
+    }
+    this.prevWallState.set(stateKey, { wall: wallAbove, price: wallTopPrice });
+
+    // 1. Wall collapsed → cancel immediately
+    if (wallAbove < dangerThreshold) {
+      this.log('trade', `WALL COLLAPSE: ${mm.market.slug} ${side} wall=$${wallAbove.toFixed(0)} < $${dangerThreshold.toFixed(0)} — cancelling`);
+      await this.cancelLpOrdersFromClob(mm, tokenIndex);
+      return 'collapsed';
+    }
+
+    // 2. Check if our order is exposed (wall moved below our price)
+    // Find where the wall actually starts now
+    const mid = tokenIndex === 0 ? mm.market.midpoint : 1 - mm.market.midpoint;
+    const reqWallSize = Math.max(this.config.minWallSize, (this.balance * CAPITAL_PER_SIDE) * WALL_MULTIPLIER);
+    const currentWall = this.findWallPrice(bids, mid, mm.market.rewardsMaxSpread, reqWallSize);
+
+    if (currentWall) {
+      const optimalPrice = currentWall.price;
+      const priceDiff = Math.abs(highestLpPrice - optimalPrice);
+      if (priceDiff >= 0.01) {
+        // Price shifted ≥ 1¢ → needs requote
+        return 'requote';
+      }
+    } else {
+      // No wall found at all → cancel
+      this.log('trade', `NO WALL: ${mm.market.slug} ${side} — cancelling`);
+      await this.cancelLpOrdersFromClob(mm, tokenIndex);
+      return 'collapsed';
+    }
+
+    return 'ok';
+  }
+
+  // ── P0: CLOB-based Order Management ──────────────────
+
+  /**
+   * Cancel LP orders using actual CLOB open orders (not engine memory).
+   * This prevents order accumulation — the root cause of $29K losses.
+   */
+  private async cancelLpOrdersFromClob(mm: ManagedMarket, tokenIndex?: number) {
+    if (!this.profile) return;
+
+    try {
+      const openOrders = await getProfileOpenOrders(this.profile);
+      const targetTokens = tokenIndex !== undefined
+        ? [mm.market.clobTokenIds[tokenIndex]]
+        : mm.market.clobTokenIds;
+
+      const toCancel = openOrders
+        .filter((o: any) => targetTokens.includes(o.asset_id) && o.side === 'BUY')
+        .map((o: any) => o.id)
+        .filter((id: string) => id);
+
+      if (toCancel.length > 0) {
+        const { cancelProfileOrders } = await import('@/lib/bot/profile-client');
+        await cancelProfileOrders(this.profile, toCancel);
+        this.log('trade', `CANCEL ${toCancel.length} orders: ${mm.market.slug}${tokenIndex !== undefined ? ` ${tokenIndex === 0 ? 'Yes' : 'No'}` : ''}`);
+      }
+    } catch (err: any) {
+      this.log('error', `CLOB cancel ${mm.market.slug}: ${err.message}`);
+    }
+
+    // Sync engine memory
+    if (tokenIndex !== undefined) {
+      mm.orders = mm.orders.filter((o) => !(o.purpose === 'lp' && o.tokenIndex === tokenIndex));
+    } else {
+      mm.orders = mm.orders.filter((o) => o.purpose === 'hedge');
+    }
+  }
+
+  // ── P1: CLOB State Sync ──────────────────────────────
+
+  /**
+   * Reconcile engine state with CLOB reality.
+   * - Cancel orphan orders (on CLOB but not tracked by engine)
+   * - Remove stale orders (in engine but not on CLOB)
+   */
+  private async syncWithClob() {
+    if (!this.profile) return;
+
+    let openOrders: any[];
+    try {
+      openOrders = await getProfileOpenOrders(this.profile);
+    } catch (err: any) {
+      this.log('error', `CLOB sync failed: ${err.message}`);
+      return;
+    }
+
+    // Build set of all tracked order IDs
+    const trackedIds = new Set<string>();
+    for (const [, mm] of this.managedMarkets) {
+      for (const o of mm.orders) {
+        if (o.orderId !== 'unknown') trackedIds.add(o.orderId);
+      }
+    }
+
+    // Find orphan orders (on CLOB but not tracked)
+    const orphanIds = openOrders
+      .filter((o: any) => !trackedIds.has(o.id))
+      .map((o: any) => o.id);
+
+    if (orphanIds.length > 0) {
+      this.log('info', `CLOB sync: cancelling ${orphanIds.length} orphan orders`);
+      try {
+        const { cancelProfileOrders } = await import('@/lib/bot/profile-client');
+        await cancelProfileOrders(this.profile, orphanIds);
+      } catch (err: any) {
+        this.log('error', `Orphan cancel: ${err.message}`);
+      }
+    }
+
+    // Remove stale orders (in engine but not on CLOB)
+    const clobIds = new Set(openOrders.map((o: any) => o.id));
+    for (const [, mm] of this.managedMarkets) {
+      const before = mm.orders.length;
+      mm.orders = mm.orders.filter((o) =>
+        o.orderId === 'unknown' || o.purpose === 'hedge' || clobIds.has(o.orderId),
+      );
+      const removed = before - mm.orders.length;
+      if (removed > 0) {
+        this.log('info', `CLOB sync: removed ${removed} stale orders from ${mm.market.slug}`);
+      }
+    }
+
+    this.log('info', `CLOB sync: ${openOrders.length} open orders, ${orphanIds.length} orphans cancelled`);
   }
 
   /**
@@ -483,8 +743,22 @@ class LpRewardsEngine {
   private async onUserTrade(trade: UserTrade) {
     if (!this.running || !this.profile) return;
 
-    // Only care about BUY fills where we are MAKER (our LP order got hit)
-    if (trade.side !== 'BUY' || trade.status !== 'MATCHED') return;
+    // Only care about BUY fills
+    if (trade.side !== 'BUY') return;
+    if (trade.status !== 'MATCHED' && trade.status !== 'MINED' && trade.status !== 'CONFIRMED') return;
+
+    // On MATCHED: cancel all remaining orders for this market immediately (before settlement)
+    if (trade.status === 'MATCHED') {
+      let mm: ManagedMarket | null = null;
+      for (const [, m] of this.managedMarkets) {
+        if (m.market.clobTokenIds.includes(trade.asset_id)) { mm = m; break; }
+      }
+      if (mm) {
+        this.log('trade', `MATCHED → emergency cancel all: ${mm.market.slug}`);
+        this.cancelLpOrdersFromClob(mm); // fire-and-forget, don't await
+      }
+      return; // Wait for MINED to sell
+    }
 
     const size = parseFloat(trade.size);
     const price = parseFloat(trade.price);
@@ -505,7 +779,7 @@ class LpRewardsEngine {
     const side = tokenIndex === 0 ? 'Yes' : tokenIndex === 1 ? 'No' : '?';
     const slug = targetMm?.market.slug ?? trade.market.slice(0, 20);
 
-    this.log('reward', `WS FILL: ${slug} BUY ${side} @${price.toFixed(2)} x${size} (instant)`);
+    this.log('reward', `WS FILL [${trade.status}]: ${slug} BUY ${side} @${price.toFixed(2)} x${size}`);
 
     // Immediately sell at fill price
     const sellPrice = roundPrice(price);
@@ -523,7 +797,7 @@ class LpRewardsEngine {
 
     try {
       // Retry with delays: CLOB balance may not reflect new tokens immediately
-      const delays = [0, 2000, 5000, 10000];
+      const delays = [0, 1000, 3000]; // MINED = tokens available, fast retry
       let sold = false;
       for (let attempt = 0; attempt < delays.length; attempt++) {
         if (delays[attempt] > 0) {
@@ -547,6 +821,9 @@ class LpRewardsEngine {
       }
       if (!sold) return;
       this.log('trade', `WS SELL: ${slug} ${side} @${sellPrice.toFixed(2)} x${size} (instant)`);
+
+      // Refresh balance after sell
+      this.refreshBalance();
 
       // Track cumulative hedged size per asset so checkFills skips already-hedged fills
       const prev = this.wsHedgedAssets.get(trade.asset_id) ?? 0;
@@ -573,281 +850,31 @@ class LpRewardsEngine {
       // checkFills will retry on next cycle as fallback
     }
 
-    // Blacklist this market — fills indicate volatility
+    // Fill detected — cancel ALL orders for this market immediately (both sides)
     if (targetMm) {
+      this.log('trade', `FILL → cancelling all orders for ${targetMm.market.slug}`);
+      await this.cancelLpOrdersFromClob(targetMm);
+      // Blacklist this market
       this.blacklistMarket(targetMm.market.conditionId, targetMm.market.slug);
     }
   }
 
-  /** Debounce map for price_change → REST wall check (prevent spamming REST) */
-  private priceCheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-  /**
-   * Called on price_change events. If best bid moved near our LP order,
-   * fetch full orderbook via REST and run wall check.
-   */
-  private checkPriceChangeWall(assetId: string, newBestBid: number) {
-    // Find managed market + check if we have LP orders on this side
-    let targetMm: ManagedMarket | null = null;
-    let tokenIndex = -1;
-    for (const [, mm] of this.managedMarkets) {
-      const idx = mm.market.clobTokenIds.indexOf(assetId);
-      if (idx >= 0) { targetMm = mm; tokenIndex = idx; break; }
-    }
-    if (!targetMm || tokenIndex < 0) return;
-
-    const lpOrders = targetMm.orders.filter((o) => o.purpose === 'lp' && o.tokenIndex === tokenIndex);
-    if (lpOrders.length === 0) return;
-
-    // Check if best bid is near or below our highest LP order (danger zone)
-    const highestLpPrice = Math.max(...lpOrders.map((o) => o.price));
-    const buffer = 0.03; // 3¢ buffer — trigger when best bid within 3¢ of our order
-    if (newBestBid > highestLpPrice + buffer) return; // Still safe, wall intact
-
-    // Debounce: 500ms per asset to avoid hammering REST
-    const timerKey = `pc-${assetId}`;
-    if (this.priceCheckTimers.has(timerKey)) return;
-
-    this.priceCheckTimers.set(timerKey, setTimeout(async () => {
-      this.priceCheckTimers.delete(timerKey);
-      if (!this.running) return;
-
-      try {
-        const client = getReadClient();
-        const book = await client.getOrderBook(assetId);
-        const bids = (book.bids ?? [])
-          .map((b: any) => ({ price: b.price, size: b.size }))
-          .sort((a: any, b: any) => parseFloat(b.price) - parseFloat(a.price));
-
-        // Update liveBooks with fresh depth
-        this.liveBooks.set(assetId, { bids, asks: book.asks ?? [], updated: Date.now() });
-
-        // Run wall check with full depth
-        this.onWsBookUpdate(assetId, bids);
-      } catch {
-        // REST failed — skip this cycle
-      }
-    }, 500));
-  }
-
-  /**
-   * Called on every WS book update. Checks if the wall protecting our LP order
-   * has collapsed. If so, immediately cancels the LP order to avoid getting filled.
-   */
-  private onWsBookUpdate(assetId: string, bids: BookLevel[]) {
-    // Find which managed market this asset belongs to
-    let targetMm: ManagedMarket | null = null;
-    let tokenIndex = -1;
-    for (const [, mm] of this.managedMarkets) {
-      const idx = mm.market.clobTokenIds.indexOf(assetId);
-      if (idx >= 0) {
-        targetMm = mm;
-        tokenIndex = idx;
-        break;
-      }
-    }
-    if (!targetMm || tokenIndex < 0) return;
-
-    // Check if we have LP orders on this side
-    const lpOrders = targetMm.orders.filter((o) => o.purpose === 'lp' && o.tokenIndex === tokenIndex);
-    if (lpOrders.length === 0) {
-      // No orders on this side — check if a wall appeared so we can enter
-      this.checkNewEntry(targetMm, tokenIndex, bids);
-      return;
-    }
-
-    // Calculate wall above our highest LP order
-    const highestLpPrice = Math.max(...lpOrders.map((o) => o.price));
-    let wallAbove = 0;
-    for (const bid of bids) {
-      const bidPrice = parseFloat(bid.price);
-      const bidSize = parseFloat(bid.size);
-      if (bidPrice > highestLpPrice && bidSize > 0) {
-        wallAbove += bidPrice * bidSize;
-      }
-    }
-
-    const myOrderCost = lpOrders.reduce((s, o) => s + o.price * o.size, 0);
-    const dangerThreshold = Math.max(this.config.minWallSize, myOrderCost * WALL_MULTIPLIER) * 0.5;
-    if (wallAbove < dangerThreshold) {
-      const timerKey = `${targetMm.market.id}-${tokenIndex}`;
-      if (!this.wsUrgentTimers.has(timerKey)) {
-        this.wsUrgentTimers.set(timerKey, setTimeout(async () => {
-          this.wsUrgentTimers.delete(timerKey);
-          if (!this.running || !this.profile) return;
-
-          const side = tokenIndex === 0 ? 'Yes' : 'No';
-          this.log('info', `WALL ALERT: ${targetMm!.market.slug} ${side} wall=$${wallAbove.toFixed(0)} < $${dangerThreshold.toFixed(0)} — pulling LP`);
-
-          // Cancel LP orders on this side only
-          const idsToCancel = targetMm!.orders
-            .filter((o) => o.purpose === 'lp' && o.tokenIndex === tokenIndex && o.orderId !== 'unknown')
-            .map((o) => o.orderId);
-
-          if (idsToCancel.length > 0) {
-            try {
-              const { cancelProfileOrders } = await import('@/lib/bot/profile-client');
-              await cancelProfileOrders(this.profile!, idsToCancel);
-              targetMm!.orders = targetMm!.orders.filter(
-                (o) => !(o.purpose === 'lp' && o.tokenIndex === tokenIndex),
-              );
-              this.log('trade', `PULLED ${idsToCancel.length} ${side} LP orders (wall collapsed)`);
-            } catch (err: any) {
-              this.log('error', `Pull ${side}: ${err.message}`);
-            }
-          }
-        }, 300)); // 300ms debounce
-      }
-    } else {
-      // Wall recovered — cancel any pending pull timer
-      const timerKey = `${targetMm.market.id}-${tokenIndex}`;
-      const timer = this.wsUrgentTimers.get(timerKey);
-      if (timer) {
-        clearTimeout(timer);
-        this.wsUrgentTimers.delete(timerKey);
-      }
-
-      // Check if we can move closer to midpoint (better Q-score)
-      this.checkBetterPlacement(targetMm, tokenIndex, bids);
-    }
-  }
-
-  /**
-   * No LP orders on this side — check if a wall just appeared so we can enter.
-   */
-  private checkNewEntry(mm: ManagedMarket, tokenIndex: number, bids: BookLevel[]) {
-    const mid = tokenIndex === 0 ? mm.market.midpoint : 1 - mm.market.midpoint;
-    const maxSpread = mm.market.rewardsMaxSpread;
-
-    const parsedBids = bids
-      .map((b) => ({ price: parseFloat(b.price), value: parseFloat(b.price) * parseFloat(b.size) }))
-      .filter((b) => b.value > 0);
-
-    const minPrice = roundPrice(mid - maxSpread / 100 + 0.01);
-    for (let candidate = roundPrice(mid - 0.01); candidate >= minPrice; candidate = roundPrice(candidate - 0.01)) {
-      if (candidate <= 0.01) break;
-      const dist = (mid - candidate) * 100;
-      if (dist > maxSpread * MAX_SPREAD_RATIO) continue;
-
-      let wallAbove = 0;
-      for (const bid of parsedBids) {
-        if (bid.price > candidate) wallAbove += bid.value;
-      }
-
-      if (wallAbove >= this.config.minWallSize) {
-        const timerKey = `entry-${mm.market.id}-${tokenIndex}`;
-        if (this.wsUrgentTimers.has(timerKey)) return;
-
-        const side = tokenIndex === 0 ? 'Yes' : 'No';
-        this.wsUrgentTimers.set(timerKey, setTimeout(async () => {
-          this.wsUrgentTimers.delete(timerKey);
-          if (!this.running || !this.profile) return;
-
-          this.log('info', `NEW WALL: ${mm.market.slug} ${side} wall=$${wallAbove.toFixed(0)} @${candidate.toFixed(2)} — entering`);
-          try {
-            this.wsRequoteInFlight = true;
-            await this.requoteMarket(mm);
-          } catch (err: any) {
-            this.log('error', `New entry ${mm.market.slug}: ${err.message}`);
-          } finally {
-            this.wsRequoteInFlight = false;
-          }
-        }, 1000));
-        return;
-      }
-    }
-  }
-
-  /**
-   * Check if a better (closer to mid) wall-protected price is now available.
-   * If so, trigger a requote for this side. Debounced to avoid excessive requotes.
-   */
-  private checkBetterPlacement(mm: ManagedMarket, tokenIndex: number, bids: BookLevel[]) {
-    const lpOrders = mm.orders.filter((o) => o.purpose === 'lp' && o.tokenIndex === tokenIndex);
-    if (lpOrders.length === 0) return;
-
-    const currentBestPrice = Math.max(...lpOrders.map((o) => o.price));
-    const mid = tokenIndex === 0 ? mm.market.midpoint : 1 - mm.market.midpoint;
-    const maxSpread = mm.market.rewardsMaxSpread;
-
-    // Parse bids
-    const parsedBids = bids
-      .map((b) => ({ price: parseFloat(b.price), value: parseFloat(b.price) * parseFloat(b.size) }))
-      .filter((b) => b.value > 0)
-      .sort((a, b) => b.price - a.price);
-
-    // Find best wall-protected price (same logic as findWallPrice)
-    const minPrice = roundPrice(mid - maxSpread / 100 + 0.01);
-    let bestPrice = 0;
-
-    for (let candidate = roundPrice(mid - 0.01); candidate >= minPrice; candidate = roundPrice(candidate - 0.01)) {
-      if (candidate <= 0.01) break;
-      let wallAbove = 0;
-      for (const bid of parsedBids) {
-        if (bid.price > candidate) wallAbove += bid.value;
-      }
-      if (wallAbove >= this.config.minWallSize) {
-        bestPrice = candidate;
-        break;
-      }
-    }
-
-    if (bestPrice <= 0) return;
-
-    // Only trigger if we can move at least 1¢ closer to mid
-    const improvement = bestPrice - currentBestPrice;
-    if (improvement < 0.01) return;
-
-    const distImprovement = improvement * 100;
-    const timerKey = `improve-${mm.market.id}-${tokenIndex}`;
-    if (this.wsUrgentTimers.has(timerKey)) return; // Already scheduled
-
-    this.wsUrgentTimers.set(timerKey, setTimeout(async () => {
-      this.wsUrgentTimers.delete(timerKey);
-      if (!this.running || !this.profile) return;
-
-      const side = tokenIndex === 0 ? 'Yes' : 'No';
-      this.log('info', `UPGRADE: ${mm.market.slug} ${side} can move ${currentBestPrice.toFixed(2)}→${bestPrice.toFixed(2)} (+${distImprovement.toFixed(1)}¢ closer)`);
-
-      // Requote this market (will recalculate both sides)
-      try {
-        this.wsRequoteInFlight = true;
-        await this.requoteMarket(mm);
-      } catch (err: any) {
-        this.log('error', `Upgrade requote ${mm.market.slug}: ${err.message}`);
-      } finally {
-        this.wsRequoteInFlight = false;
-      }
-    }, 1000)); // 1s debounce — don't thrash on rapid book updates
-  }
-
-  /** Subscribe new assets when markets are added */
-  private subscribeNewAssets(tokenIds: string[]) {
-    if (!this.ws) return;
-    const newIds = tokenIds.filter((id) => !this.liveBooks.has(id));
-    if (newIds.length > 0) {
-      this.ws.subscribe(newIds);
-    }
-  }
 
   /** Get live orderbook for an asset, fallback to REST if WS not ready */
+  /** Get orderbook — uses poll cache if fresh, otherwise REST fetch */
   private async getOrderBook(tokenId: string): Promise<{ bids: BookLevel[]; asks: BookLevel[] }> {
+    // Use cached data from REST polling if fresh (< 10s)
     const live = this.liveBooks.get(tokenId);
-    // Use WS data only if it has real depth (price_change events send size='0')
-    if (live && (Date.now() - live.updated) < 60_000) {
-      const realBids = live.bids.filter((b) => parseFloat(b.size) > 0);
-      if (realBids.length >= 2) {
-        const bids = [...live.bids].sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
-        const asks = [...live.asks].sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
-        return { bids, asks };
-      }
+    if (live && (Date.now() - live.updated) < 10_000) {
+      return { bids: live.bids, asks: live.asks };
     }
-    // Fallback to REST for full depth — sort bids desc, asks asc
+    // REST fetch
     try {
       const client = getReadClient();
       const book = await client.getOrderBook(tokenId);
       const bids = (book.bids ?? []).sort((a: BookLevel, b: BookLevel) => parseFloat(b.price) - parseFloat(a.price));
       const asks = (book.asks ?? []).sort((a: BookLevel, b: BookLevel) => parseFloat(a.price) - parseFloat(b.price));
+      this.liveBooks.set(tokenId, { bids, asks, updated: Date.now() });
       return { bids, asks };
     } catch {
       return { bids: [], asks: [] };
@@ -1109,6 +1136,9 @@ class LpRewardsEngine {
         this.balance = await getProfileBalance(this.profile);
       } catch { /* keep last */ }
 
+      // Fetch daily earnings (non-blocking)
+      this.fetchEarnings().catch(() => {});
+
       // Rank candidates: union of top by ROI + top by absolute reward rate
       // This ensures high-reward markets (sports) are included even if ROI is low
       const roiCandidates = rankMarketsByEfficiency(
@@ -1139,65 +1169,55 @@ class LpRewardsEngine {
 
       this.log('info', `${candidates.length} candidates (${roiCandidates.length} ROI + ${rateCandidates.length} top rate) → walls ($${dynamicWallSize.toFixed(0)} = ${WALL_MULTIPLIER}x $${capitalPerSide.toFixed(0)})...`);
 
-      // ── Wall check via REST (one-time per scan) ──
+      // ── Wall check via REST (parallel batches) ──
       const client = getReadClient();
       const wallChecked: RewardEfficiency[] = [];
 
-      for (const eff of candidates) {
+      // Batch fetch all orderbooks in parallel
+      for (let i = 0; i < candidates.length; i += LpRewardsEngine.BATCH_SIZE) {
         if (wallChecked.length >= this.config.maxMarkets) break;
 
-        // Check Yes side wall
-        try {
-          const yesBook = await client.getOrderBook(eff.market.clobTokenIds[0]);
-          const yesWall = this.findWallPrice(
-            yesBook.bids ?? [],
-            eff.market.midpoint,
-            eff.market.rewardsMaxSpread,
-            dynamicWallSize,
-          );
+        const batch = candidates.slice(i, i + LpRewardsEngine.BATCH_SIZE);
+        const results = await Promise.allSettled(
+          batch.map(async (eff) => {
+            const isTightSpread = this.config.allowTightSpread && eff.market.rewardsMaxSpread <= 2;
 
-          // Tight-spread markets (<=2¢): skip wall check, use edge strategy instead
-          const isTightSpread = this.config.allowTightSpread && eff.market.rewardsMaxSpread <= 2;
-          if (!yesWall && !isTightSpread) continue;
+            // Fetch YES + NO books in parallel
+            const [yesRes, noRes] = await Promise.allSettled([
+              client.getOrderBook(eff.market.clobTokenIds[0]),
+              this.config.twoSided ? client.getOrderBook(eff.market.clobTokenIds[1]) : Promise.resolve(null),
+            ]);
 
-          if (yesWall) {
-            // Check distance from mid — skip if wall is in the outer low-Q zone
-            const yesDistCents = (eff.market.midpoint - yesWall.price) * 100;
-            const yesMaxDist = eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO;
-            if (yesDistCents > yesMaxDist && !isTightSpread) {
-              this.log('info', `${eff.market.slug}: Yes wall too far (${yesDistCents.toFixed(1)}¢ > ${yesMaxDist.toFixed(1)}¢) — skipping`);
-              continue;
+            const yesBook = yesRes.status === 'fulfilled' ? yesRes.value : null;
+            const noBook = noRes.status === 'fulfilled' ? noRes.value : null;
+            if (!yesBook) return null;
+
+            const yesWall = this.findWallPrice(yesBook.bids ?? [], eff.market.midpoint, eff.market.rewardsMaxSpread, dynamicWallSize);
+            if (!yesWall && !isTightSpread) return null;
+
+            if (yesWall) {
+              const yesDistCents = (eff.market.midpoint - yesWall.price) * 100;
+              if (yesDistCents > eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO && !isTightSpread) return null;
             }
-          }
 
-          // Check No side too
-          if (this.config.twoSided) {
-            const noBook = await client.getOrderBook(eff.market.clobTokenIds[1]);
-            const noMid = 1 - eff.market.midpoint;
-            const noWall = this.findWallPrice(
-              noBook.bids ?? [],
-              noMid,
-              eff.market.rewardsMaxSpread,
-              dynamicWallSize,
-            );
-            if (!noWall && !isTightSpread) continue;
-
-            if (noWall) {
-              const noDistCents = (noMid - noWall.price) * 100;
-              const noMaxDist = eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO;
-              if (noDistCents > noMaxDist && !isTightSpread) {
-                this.log('info', `${eff.market.slug}: No wall too far (${noDistCents.toFixed(1)}¢ > ${noMaxDist.toFixed(1)}¢) — skipping`);
-                continue;
+            if (this.config.twoSided && noBook) {
+              const noMid = 1 - eff.market.midpoint;
+              const noWall = this.findWallPrice(noBook.bids ?? [], noMid, eff.market.rewardsMaxSpread, dynamicWallSize);
+              if (!noWall && !isTightSpread) return null;
+              if (noWall) {
+                const noDistCents = (noMid - noWall.price) * 100;
+                if (noDistCents > eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO && !isTightSpread) return null;
               }
             }
-          }
 
-          if (isTightSpread) {
-            this.log('info', `${eff.market.slug}: tight spread (${eff.market.rewardsMaxSpread}¢) — edge strategy`);
+            return eff;
+          }),
+        );
+
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value && wallChecked.length < this.config.maxMarkets) {
+            wallChecked.push(r.value);
           }
-          wallChecked.push(eff);
-        } catch {
-          continue;
         }
       }
 
@@ -1220,7 +1240,6 @@ class LpRewardsEngine {
             this.log('info', `Removing ${mm.market.slug}${daysLeft < MIN_DAYS_TO_EXPIRY ? ' (expiring)' : ' (not optimal)'}`);
             await this.cancelMarketOrders(id);
             // Unsubscribe WS
-            if (this.ws) this.ws.unsubscribe(mm.market.clobTokenIds);
             if (this.userWs) this.userWs.unsubscribe([mm.market.conditionId]);
             this.managedMarkets.delete(id);
           }
@@ -1258,7 +1277,6 @@ class LpRewardsEngine {
             inventoryNo: 0,
           });
           // Subscribe to orderbook WS + user WS for this market
-          this.subscribeNewAssets(eff.market.clobTokenIds);
           if (this.userWs) this.userWs.subscribe([eff.market.conditionId]);
           const daysLeft = (new Date(eff.market.endDate).getTime() - Date.now()) / 86400000;
           const comp = eff.market.competitiveness > 0 ? eff.market.competitiveness.toFixed(0) : '?';
@@ -1336,6 +1354,7 @@ class LpRewardsEngine {
         });
         const received = parseFloat((result as any)?.takingAmount ?? '0');
         this.log('trade', `SWEEP SELL: ${title} ${outcome} x${size.toFixed(0)} @${sellPrice.toFixed(2)} → $${received.toFixed(2)}`);
+        this.refreshBalance();
       } catch (err: any) {
         this.log('error', `Sweep sell ${title}: ${err.message}`);
       }
@@ -1370,6 +1389,8 @@ class LpRewardsEngine {
     }
   }
 
+  private static readonly REQUOTE_BATCH_SIZE = 10; // parallel requote batch size
+
   private async requoteAll() {
     if (!this.running || !this.profile) return;
 
@@ -1384,15 +1405,15 @@ class LpRewardsEngine {
       mm.allocatedCapital = perMarketCap;
     }
 
-    for (const [, mm] of this.managedMarkets) {
-      if (!this.running) break;
-
-      try {
-        await this.requoteMarket(mm);
-      } catch (err: any) {
-        this.log('error', `Requote ${mm.market.slug}: ${err.message}`);
-      }
-    }
+    // Fire all requotes with 300ms stagger — no need to await
+    const markets = [...this.managedMarkets.values()];
+    markets.forEach((mm, idx) => {
+      setTimeout(() => {
+        this.requoteMarket(mm).catch((err: any) => {
+          this.log('error', `Requote ${mm.market.slug}: ${err.message}`);
+        });
+      }, idx * 300);
+    });
   }
 
   // ── Orderbook Wall Detection ────────────────────────────
@@ -1493,8 +1514,9 @@ class LpRewardsEngine {
     // Skip extreme midpoints
     if (liveMid < MIN_MIDPOINT || liveMid > MAX_MIDPOINT) return;
 
-    // Skip markets where maxSpread is too small
-    if (maxSpread <= this.config.minSpreadCents) return;
+    // Skip markets where maxSpread is too small (unless tight spread allowed)
+    const isTightAllowed = this.config.allowTightSpread && maxSpread <= 2;
+    if (maxSpread <= this.config.minSpreadCents && !isTightAllowed) return;
 
     const noMid = 1 - liveMid;
 
@@ -1519,10 +1541,9 @@ class LpRewardsEngine {
       return;
     }
 
-    // For tight-spread markets: place at maxSpread edge (furthest from mid but still in reward zone)
-    // This minimizes fill risk while still earning rewards
+    // For tight-spread markets: place at maxSpread edge
     const yesBidPrice = isTightSpread
-      ? roundPrice(liveMid - maxSpread / 100 + 0.01)  // edge of reward zone
+      ? roundPrice(liveMid - maxSpread / 100 + 0.01)
       : yesWall!.price;
     const noBidPrice = isTightSpread
       ? roundPrice(noMid - maxSpread / 100 + 0.01)
@@ -1533,74 +1554,117 @@ class LpRewardsEngine {
     const noDistCents = (noMid - noBidPrice) * 100;
     if (yesDistCents > maxSpread || yesDistCents < 0) return;
 
-    // ── Single order at closest wall-protected price ──
-    // No ladder needed — fills are immediately market-sold.
-    // Maximize Q-score by placing at the closest possible price to mid.
-    const minSize = Math.max(market.rewardsMinSize || 1, 1);
+    // ── Ladder: place orders from wall price down to maxSpread edge ──
+    // All prices behind the wall earn rewards. More prices = more Q-score = more rewards.
+    const rawMinSize = Math.max(market.rewardsMinSize || 1, 1);
     const capitalPerSide = this.balance * CAPITAL_PER_SIDE;
-    const yesSize = Math.max(minSize, Math.floor(capitalPerSide / yesBidPrice));
-    const noSize = noBidPrice > 0 ? Math.max(minSize, Math.floor(capitalPerSide / noBidPrice)) : 0;
 
-    // Only requote if price changed meaningfully
+    // Build ladder prices for each side
+    const yesLadder: number[] = [];
+    const maxYesDist = maxSpread * MAX_SPREAD_RATIO;
+    for (let p = yesBidPrice; p >= roundPrice(liveMid - maxYesDist / 100); p = roundPrice(p - 0.01)) {
+      if (p <= 0.01 || p >= 0.99) continue;
+      yesLadder.push(p);
+    }
+
+    const noLadder: number[] = [];
+    if (this.config.twoSided && noBidPrice > 0) {
+      const maxNoDist = maxSpread * MAX_SPREAD_RATIO;
+      for (let p = noBidPrice; p >= roundPrice(noMid - maxNoDist / 100); p = roundPrice(p - 0.01)) {
+        if (p <= 0.01 || p >= 0.99) continue;
+        noLadder.push(p);
+      }
+    }
+
+    // Split capital across ladder rungs (Polymarket locks balance per order)
+    const totalRungs = yesLadder.length + noLadder.length;
+    const capitalPerRung = totalRungs > 0 ? capitalPerSide / totalRungs : capitalPerSide;
+
+    // Check if requote needed — compare ladder with existing orders
     const lpOrders = mm.orders.filter((o) => o.purpose === 'lp');
-    const needsRequote = lpOrders.length === 0 ||
-      lpOrders.some((o) => {
-        const expected = o.tokenIndex === 0 ? yesBidPrice : noBidPrice;
-        return Math.abs(o.price - expected) > 0.005;
-      });
-
-    if (!needsRequote) return;
+    const existingYesPrices = lpOrders.filter((o) => o.tokenIndex === 0).map((o) => o.price).sort();
+    const existingNoPrices = lpOrders.filter((o) => o.tokenIndex === 1).map((o) => o.price).sort();
+    const sameLadder = (existing: number[], ladder: number[]) => {
+      if (existing.length !== ladder.length) return false;
+      const sorted = [...ladder].sort();
+      return existing.every((p, i) => Math.abs(p - sorted[i]) < 0.005);
+    };
+    if (sameLadder(existingYesPrices, yesLadder) && sameLadder(existingNoPrices, noLadder)) return;
 
     await this.cancelLpOrders(mm);
 
     const newOrders: ActiveOrder[] = [...mm.orders]; // Keep hedge orders
 
-    // BUY Yes — at closest wall-protected price
-    if (yesBidPrice > 0.01 && yesBidPrice < 0.99) {
-      try {
-        const result = await placeProfileOrder(this.profile, {
-          tokenId: market.clobTokenIds[0],
-          side: 'BUY',
-          price: yesBidPrice,
-          size: yesSize,
-          postOnly: true,
-        });
-        const orderId = (result as any)?.orderID ?? (result as any)?.id ?? 'unknown';
-        newOrders.push({
-          orderId, tokenId: market.clobTokenIds[0], tokenIndex: 0,
-          side: 'BUY', price: yesBidPrice, size: yesSize,
-          originalSize: yesSize, marketId: market.id, purpose: 'lp',
-        });
-        this.log('trade', `${market.slug} BUY Yes @${yesBidPrice.toFixed(2)} x${yesSize} ($${(yesBidPrice * yesSize).toFixed(0)}) (${yesDistCents.toFixed(1)}¢) [wall=$${yesWall?.wallSize.toFixed(0) ?? '?'}]`);
-      } catch (err: any) {
-        this.log('error', `${market.slug} BUY Yes: ${err.message}`);
+    // Interleave YES and NO: place YES[0], NO[0], YES[1], NO[1], ...
+    // This maximizes Q-score early (both sides covered from first orders)
+    const maxLen = Math.max(yesLadder.length, noLadder.length);
+    let orderIdx = 0;
+    for (let li = 0; li < maxLen; li++) {
+      // YES rung
+      if (li < yesLadder.length) {
+        if (orderIdx > 0) await new Promise((r) => setTimeout(r, 100));
+        const price = yesLadder[li];
+        const dist = (liveMid - price) * 100;
+        const size = Math.max(rawMinSize, Math.floor(capitalPerRung / price));
+        try {
+          const result = await placeProfileOrder(this.profile, {
+            tokenId: market.clobTokenIds[0],
+            side: 'BUY',
+            price,
+            size,
+            postOnly: true,
+          });
+          const orderId = (result as any)?.orderID ?? (result as any)?.id ?? 'unknown';
+          newOrders.push({
+            orderId, tokenId: market.clobTokenIds[0], tokenIndex: 0,
+            side: 'BUY', price, size,
+            originalSize: size, marketId: market.id, purpose: 'lp',
+          });
+          this.log('trade', `${market.slug} BUY Yes @${price.toFixed(2)} x${size} ($${(price * size).toFixed(0)}) (${dist.toFixed(1)}¢) [wall=$${yesWall?.wallSize.toFixed(0) ?? '?'}] [id=${orderId.slice(0, 10)}]`);
+          orderIdx++;
+        } catch (err: any) {
+          this.log('error', `${market.slug} BUY Yes @${price.toFixed(2)}: ${err.message}`);
+          break; // Balance exhausted
+        }
       }
-    }
 
-    // BUY No — at closest wall-protected price
-    if (this.config.twoSided && noBidPrice > 0.01 && noBidPrice < 0.99 && noDistCents <= maxSpread) {
-      try {
-        const result = await placeProfileOrder(this.profile, {
-          tokenId: market.clobTokenIds[1],
-          side: 'BUY',
-          price: noBidPrice,
-          size: noSize,
-          postOnly: true,
-        });
-        const orderId = (result as any)?.orderID ?? (result as any)?.id ?? 'unknown';
-        newOrders.push({
-          orderId, tokenId: market.clobTokenIds[1], tokenIndex: 1,
-          side: 'BUY', price: noBidPrice, size: noSize,
-          originalSize: noSize, marketId: market.id, purpose: 'lp',
-        });
-        this.log('trade', `${market.slug} BUY No @${noBidPrice.toFixed(2)} x${noSize} ($${(noBidPrice * noSize).toFixed(0)}) (${noDistCents.toFixed(1)}¢) [wall=$${noWall!.wallSize.toFixed(0)}]`);
-      } catch (err: any) {
-        this.log('error', `${market.slug} BUY No: ${err.message}`);
+      // NO rung
+      if (li < noLadder.length) {
+        const price = noLadder[li];
+        const dist = (noMid - price) * 100;
+        if (dist <= maxSpread) {
+          if (orderIdx > 0) await new Promise((r) => setTimeout(r, 100));
+          const size = Math.max(rawMinSize, Math.floor(capitalPerRung / price));
+          try {
+            const result = await placeProfileOrder(this.profile, {
+              tokenId: market.clobTokenIds[1],
+              side: 'BUY',
+              price,
+              size,
+              postOnly: true,
+            });
+            const orderId = (result as any)?.orderID ?? (result as any)?.id ?? 'unknown';
+            newOrders.push({
+              orderId, tokenId: market.clobTokenIds[1], tokenIndex: 1,
+              side: 'BUY', price, size,
+              originalSize: size, marketId: market.id, purpose: 'lp',
+            });
+            this.log('trade', `${market.slug} BUY No @${price.toFixed(2)} x${size} ($${(price * size).toFixed(0)}) (${dist.toFixed(1)}¢) [wall=$${noWall?.wallSize.toFixed(0) ?? '?'}] [id=${orderId.slice(0, 10)}]`);
+            orderIdx++;
+          } catch (err: any) {
+            this.log('error', `${market.slug} BUY No @${price.toFixed(2)}: ${err.message}`);
+            break; // Balance exhausted
+          }
+        }
       }
     }
 
     mm.orders = newOrders;
     mm.lastUpdate = Date.now();
+
+    if (yesLadder.length + noLadder.length > 2) {
+      this.log('info', `${market.slug}: ladder ${yesLadder.length} Yes + ${noLadder.length} No prices`);
+    }
 
     // Recalculate Q score
     const lpOrdersForScore: LpOrder[] = newOrders
@@ -1611,7 +1675,11 @@ class LpRewardsEngine {
 
   // ── Fill Detection & Hedging ────────────────────────────
 
-  private async checkFills() {
+  /**
+   * CLOB Sync (30s) — reconcile engine state with CLOB reality.
+   * Fill detection is handled by User WS; this is the safety net.
+   */
+  private async clobSync() {
     if (!this.running || !this.profile) return;
 
     let openOrders: any[];
@@ -1621,95 +1689,56 @@ class LpRewardsEngine {
 
     const openOrderIds = new Set(openOrders.map((o: any) => o.id));
 
+    // 1. Cancel orphan orders (on CLOB but not tracked by engine)
+    const trackedIds = new Set<string>();
     for (const [, mm] of this.managedMarkets) {
-      const filledOrders: ActiveOrder[] = [];
-      const stillActive: ActiveOrder[] = [];
-
-      for (const order of mm.orders) {
-        if (order.orderId === 'unknown') {
-          stillActive.push(order);
-          continue;
-        }
-
-        if (openOrderIds.has(order.orderId)) {
-          // Check for partial fill — only sell the NEW portion not already hedged by WS
-          if (order.purpose === 'lp') {
-            const openOrder = openOrders.find((o: any) => o.id === order.orderId);
-            if (openOrder) {
-              const sizeMatched = parseFloat(openOrder.size_matched ?? '0');
-              const alreadyHedged = (order as any)._hedgedSize ?? 0;
-              const wsHedged = (order as any)._wsHedgedSize ?? 0;
-              const totalHedged = Math.max(alreadyHedged, wsHedged);
-              const newFill = sizeMatched - totalHedged;
-              if (newFill > 0.5) { // Min 0.5 shares to avoid dust
-                this.log('reward', `PARTIAL: ${mm.market.slug} ${order.tokenIndex === 0 ? 'Yes' : 'No'} @${order.price} filled ${newFill.toFixed(1)} (total ${sizeMatched.toFixed(1)}, wsHedged ${wsHedged.toFixed(1)})`);
-                this.updateInventory(mm, order.tokenIndex, newFill);
-                await this.placeHedge(mm, order, newFill);
-                (order as any)._hedgedSize = sizeMatched; // Track what we've hedged
-              }
-            }
-          }
-          stillActive.push(order);
-        } else if (order.purpose === 'lp') {
-          // LP order gone from open list — could be filled OR cancelled
-          // Check actual token balance to confirm it was filled
-          const wsHedged = (order as any)._wsHedgedSize ?? 0;
-          let actualFilled = wsHedged; // WS already confirmed this amount
-          if (wsHedged < order.originalSize) {
-            // Check real token balance to verify fill
-            try {
-              const tokenBalance = await getProfileTokenBalance(this.profile!, order.tokenId);
-              if (tokenBalance > 0.5) {
-                actualFilled = Math.max(wsHedged, tokenBalance);
-              }
-            } catch { /* assume cancelled if can't check */ }
-          }
-          const remaining = actualFilled - wsHedged;
-          if (remaining > 0.5) {
-            filledOrders.push({ ...order, originalSize: remaining });
-          } else if (wsHedged > 0.5) {
-            // Already fully hedged by WS, just clean up
-            this.log('info', `${mm.market.slug} ${order.tokenIndex === 0 ? 'Yes' : 'No'} already hedged by WS (${wsHedged.toFixed(1)}), skipping`);
-          } else {
-            // No fill detected — order was cancelled (wall collapse, requote, etc.)
-            this.log('info', `${mm.market.slug} ${order.tokenIndex === 0 ? 'Yes' : 'No'} order gone — cancelled (no fill detected)`);
-          }
-        }
-        // Hedge orders that disappear = position exited
+      for (const o of mm.orders) {
+        if (o.orderId !== 'unknown') trackedIds.add(o.orderId);
       }
-
-      for (const filled of filledOrders) {
-        this.log('reward', `FILLED: ${mm.market.slug} BUY ${filled.tokenIndex === 0 ? 'Yes' : 'No'} @${filled.price.toFixed(2)} x${filled.originalSize}`);
-        this.updateInventory(mm, filled.tokenIndex, filled.originalSize);
-        await this.placeHedge(mm, filled, filled.originalSize);
-        // Blacklist this market — fills indicate volatility
-        this.blacklistMarket(mm.market.conditionId, mm.market.slug);
+    }
+    const orphanIds = openOrders
+      .filter((o: any) => !trackedIds.has(o.id))
+      .map((o: any) => o.id);
+    if (orphanIds.length > 0) {
+      this.log('info', `CLOB sync: cancelling ${orphanIds.length} orphan orders`);
+      try {
+        const { cancelProfileOrders } = await import('@/lib/bot/profile-client');
+        await cancelProfileOrders(this.profile, orphanIds);
+      } catch (err: any) {
+        this.log('error', `Orphan cancel: ${err.message}`);
       }
+    }
 
-      mm.orders = stillActive;
+    // 2. Remove stale orders from engine (in engine but gone from CLOB)
+    for (const [, mm] of this.managedMarkets) {
+      mm.orders = mm.orders.filter((o) => {
+        if (o.orderId === 'unknown' || o.purpose === 'hedge') return true;
+        return openOrderIds.has(o.orderId);
+      });
 
-      // Clean up exited positions
+      // Clean up exited hedge positions
       mm.positions = mm.positions.filter((pos) => {
         if (!pos.hedgeOrderId) return true;
         if (openOrderIds.has(pos.hedgeOrderId)) return true;
         const pnl = (pos.hedgePrice - pos.fillPrice) * pos.size;
         this.log('reward', `HEDGE EXIT: ${mm.market.slug} ${pos.tokenIndex === 0 ? 'Yes' : 'No'} entry=${pos.fillPrice.toFixed(2)} exit=${pos.hedgePrice.toFixed(2)} pnl=$${pnl.toFixed(2)}`);
-        // Reduce inventory
         this.updateInventory(mm, pos.tokenIndex, -pos.size);
         return false;
       });
 
-      // Force market-sell stale hedges that haven't filled within timeout
+      // Force exit stale hedges
       await this.forceExitStaleHedges(mm, openOrderIds);
 
-      // Clean up wsHedgedAssets for this market's tokens (orders are gone)
+      // Clean wsHedgedAssets
       for (const tokenId of mm.market.clobTokenIds) {
         this.wsHedgedAssets.delete(tokenId);
       }
     }
 
-    // Retry pending sells (failed hedges from previous cycles)
+    // 3. Retry pending sells
     await this.retryPendingSells();
+
+    this.log('info', `CLOB sync: ${openOrders.length} open, ${orphanIds.length} orphans cancelled`);
   }
 
   private async retryPendingSells() {
@@ -1749,6 +1778,7 @@ class LpRewardsEngine {
         });
         const received = parseFloat((result as any)?.takingAmount ?? '0');
         this.log('trade', `PENDING SELL OK: ${ps.marketSlug} ${ps.side} x${ps.size} @${sellPrice.toFixed(2)} → $${received.toFixed(2)} (waited ${((Date.now() - ps.addedAt) / 1000).toFixed(0)}s)`);
+        this.refreshBalance();
       } catch (err: any) {
         this.log('error', `Pending sell retry ${ps.marketSlug} ${ps.side}: ${err.message}`);
         remaining.push(ps);
@@ -1830,7 +1860,6 @@ class LpRewardsEngine {
     const mm = [...this.managedMarkets.values()].find((m) => m.market.conditionId === conditionId);
     if (mm) {
       await this.cancelMarketOrders(mm.market.id);
-      if (this.ws) this.ws.unsubscribe(mm.market.clobTokenIds);
       if (this.userWs) this.userWs.unsubscribe([mm.market.conditionId]);
       this.managedMarkets.delete(mm.market.id);
     }
@@ -1845,6 +1874,14 @@ class LpRewardsEngine {
     } catch (err: any) {
       this.log('error', `Blacklist DB write: ${err.message}`);
     }
+  }
+
+  /** Refresh balance from CLOB after sell — fire and forget */
+  private refreshBalance() {
+    if (!this.profile) return;
+    getProfileBalance(this.profile).then((b) => {
+      this.balance = b;
+    }).catch(() => { /* silent */ });
   }
 
   private updateInventory(mm: ManagedMarket, tokenIndex: number, delta: number) {
@@ -1883,6 +1920,7 @@ class LpRewardsEngine {
 
         this.log('trade', `SELL NOW: ${mm.market.slug} ${side} @${sellPrice.toFixed(2)} x${filledSize} (filled @${filled.price.toFixed(2)})${attempt > 0 ? ` [retry #${attempt}]` : ''}`);
         this.updateInventory(mm, filled.tokenIndex, -filledSize);
+        this.refreshBalance();
         return; // Success — exit
       } catch (err: any) {
         if (attempt < delays.length - 1 && /balance.*allowance|allowance/i.test(err.message)) {
@@ -1939,21 +1977,9 @@ class LpRewardsEngine {
 
   // ── Order Management ────────────────────────────────────
 
+  /** Cancel LP orders — delegates to CLOB-based cancel (P0) */
   private async cancelLpOrders(mm: ManagedMarket) {
-    if (!this.profile) return;
-    const lpOrderIds = mm.orders
-      .filter((o) => o.purpose === 'lp' && o.orderId !== 'unknown')
-      .map((o) => o.orderId);
-
-    if (lpOrderIds.length > 0) {
-      try {
-        const { cancelProfileOrders } = await import('@/lib/bot/profile-client');
-        await cancelProfileOrders(this.profile, lpOrderIds);
-      } catch (err: any) {
-        this.log('error', `Cancel LP orders: ${err.message}`);
-      }
-    }
-    mm.orders = mm.orders.filter((o) => o.purpose === 'hedge');
+    await this.cancelLpOrdersFromClob(mm);
   }
 
   private async cancelMarketOrders(marketId: string) {
@@ -1970,6 +1996,42 @@ class LpRewardsEngine {
       this.log('error', `Cancel orders for ${marketId}: ${err.message}`);
     }
     mm.orders = [];
+  }
+
+  /** Get depth levels per 1¢ from mid to maxSpread edge for visualization */
+  private getDepthLevels(mm: ManagedMarket, tokenIndex: number): Array<{ price: number; size: number; isMyOrder: boolean }> {
+    const mid = tokenIndex === 0 ? mm.market.midpoint : 1 - mm.market.midpoint;
+    const maxSpread = mm.market.rewardsMaxSpread;
+    const book = this.liveBooks.get(mm.market.clobTokenIds[tokenIndex]);
+    const myPrices = new Set(
+      mm.orders.filter((o) => o.purpose === 'lp' && o.tokenIndex === tokenIndex).map((o) => o.price),
+    );
+
+    const levels: Array<{ price: number; size: number; isMyOrder: boolean }> = [];
+    const steps = Math.min(10, Math.ceil(maxSpread));
+
+    for (let i = 0; i < steps; i++) {
+      const price = roundPrice(mid - (i + 1) * 0.01);
+      if (price <= 0.01) break;
+
+      let size = 0;
+      if (book?.bids) {
+        for (const b of book.bids) {
+          const bp = parseFloat(b.price);
+          if (Math.abs(bp - price) < 0.005) {
+            size += parseFloat(b.price) * parseFloat(b.size);
+          }
+        }
+      }
+
+      levels.push({
+        price,
+        size,
+        isMyOrder: myPrices.has(price),
+      });
+    }
+
+    return levels;
   }
 
   private log(type: LpLogLine['type'], text: string) {

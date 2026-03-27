@@ -20,6 +20,27 @@ export async function GET(req: Request) {
     }
   }
 
+  // GET /api/lp?earnings=true&profileId=xxx — fetch daily earnings
+  if (url.searchParams.get('earnings') === 'true') {
+    const pid = url.searchParams.get('profileId');
+    if (!pid) return NextResponse.json({ error: 'profileId required' }, { status: 400 });
+    try {
+      const { loadProfile, getClientForProfile } = await import('@/lib/bot/profile-client');
+      const profile = await loadProfile(pid);
+      if (!profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
+      const client = getClientForProfile(profile);
+      const today = new Date().toISOString().slice(0, 10);
+      const [earnings, totalEarnings, marketsConfig] = await Promise.all([
+        client.getEarningsForUserForDay(today),
+        client.getTotalEarningsForUserForDay(today),
+        client.getUserEarningsAndMarketsConfig(today),
+      ]);
+      return NextResponse.json({ earnings, totalEarnings, marketsConfig, date: today });
+    } catch (err: any) {
+      return NextResponse.json({ error: err.message }, { status: 500 });
+    }
+  }
+
   // GET /api/lp?positions=true&profileId=xxx — fetch all open positions
   if (url.searchParams.get('positions') === 'true') {
     const pid = url.searchParams.get('profileId') ?? 'cmlmpyou700bn0y09gh4fem6y';
