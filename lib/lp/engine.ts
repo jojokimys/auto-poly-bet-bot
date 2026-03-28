@@ -146,6 +146,8 @@ export interface ManagedMarketStatus {
   /** Depth data per price level for visualization: { price, size$ } from mid outward */
   depthYes: Array<{ price: number; size: number; isMyOrder: boolean }>;
   depthNo: Array<{ price: number; size: number; isMyOrder: boolean }>;
+  /** Current adaptive wall poll interval in ms */
+  pollIntervalMs: number;
 }
 
 // ─── Constants ───────────────────────────────────────────
@@ -164,8 +166,8 @@ const CASH_RESERVE_PCT = 0.05;      // Keep 5% cash reserve
 const CAPITAL_PER_SIDE = 0.47;      // 47% of balance per side (~$100 at $212 balance)
 const INVENTORY_WARN_PCT = 0.30;    // Start skewing at 30% inventory imbalance
 const INVENTORY_MAX_PCT = 0.50;     // Pull quotes at 50% inventory imbalance
-const MIN_MIDPOINT = 0.10;          // Skip extreme probability markets
-const MAX_MIDPOINT = 0.90;
+const MIN_MIDPOINT = 0.05;          // Skip extreme probability markets
+const MAX_MIDPOINT = 0.95;
 const DEFAULT_MIN_WALL_SIZE = 3000; // Absolute minimum $ wall
 const WALL_MULTIPLIER = 3;          // Wall must be >= 3x our order size per side
 const MIN_LIQUIDITY = 10_000;       // Skip markets with < $10K liquidity
@@ -320,6 +322,11 @@ class LpRewardsEngine {
         })(),
         depthYes: this.getDepthLevels(mm, 0),
         depthNo: this.getDepthLevels(mm, 1),
+        pollIntervalMs: (() => {
+          const s0 = this.prevWallState.get(`${mm.market.id}-0`)?.pollMs ?? LpRewardsEngine.WALL_POLL_DEFAULT_MS;
+          const s1 = this.prevWallState.get(`${mm.market.id}-1`)?.pollMs ?? LpRewardsEngine.WALL_POLL_DEFAULT_MS;
+          return Math.min(s0, s1);
+        })(),
       });
     }
 
@@ -477,10 +484,16 @@ class LpRewardsEngine {
         for (const [, mm] of this.managedMarkets) {
           const hasOrders = mm.orders.some((o) => o.purpose === 'lp');
           const lastCheck = this.lastWallCheck.get(mm.market.id) ?? 0;
-          const cooldown = hasOrders ? LpRewardsEngine.WALL_POLL_ACTIVE_MS : LpRewardsEngine.WALL_POLL_IDLE_MS;
-          if (now - lastCheck >= cooldown) {
-            if (hasOrders) active.push(mm);
-            else idle.push(mm);
+          if (hasOrders) {
+            // Adaptive poll: use per-market interval from wall stability tracking
+            const stateKey0 = `${mm.market.id}-0`;
+            const stateKey1 = `${mm.market.id}-1`;
+            const poll0 = this.prevWallState.get(stateKey0)?.pollMs ?? LpRewardsEngine.WALL_POLL_DEFAULT_MS;
+            const poll1 = this.prevWallState.get(stateKey1)?.pollMs ?? LpRewardsEngine.WALL_POLL_DEFAULT_MS;
+            const cooldown = Math.min(poll0, poll1); // use fastest of the two sides
+            if (now - lastCheck >= cooldown) active.push(mm);
+          } else {
+            if (now - lastCheck >= LpRewardsEngine.WALL_POLL_IDLE_MS) idle.push(mm);
           }
         }
 
@@ -570,8 +583,12 @@ class LpRewardsEngine {
    * Check if the wall protecting our LP order on a given side has collapsed.
    * If so, immediately cancel the LP order.
    */
-  /** Track previous wall state for change logging */
-  private prevWallState = new Map<string, { wall: number; price: number }>();
+  /** Track previous wall state for change logging + adaptive poll interval */
+  private prevWallState = new Map<string, { wall: number; price: number; stableCount: number; pollMs: number }>();
+
+  private static readonly WALL_POLL_MIN_MS = 1_000;     // fastest: 1s (wall changing)
+  private static readonly WALL_POLL_DEFAULT_MS = 3_000; // default: 3s
+  private static readonly WALL_POLL_MAX_MS = 10_000;    // slowest: 10s (wall stable)
 
   /**
    * Check wall health + price position for a given side.
@@ -597,20 +614,43 @@ class LpRewardsEngine {
     }
 
     const myOrderCost = lpOrders.reduce((s, o) => s + o.price * o.size, 0);
-    const dangerThreshold = Math.max(this.config.minWallSize, myOrderCost * WALL_MULTIPLIER) * 0.5;
+    const isTight = this.config.allowTightSpread && mm.market.rewardsMaxSpread <= 2;
+    const dangerThreshold = isTight
+      ? Math.max(3, myOrderCost * 0.3) // Tight: relaxed — $3 or 30% of order cost
+      : Math.max(this.config.minWallSize, myOrderCost * WALL_MULTIPLIER) * 0.5;
 
-    // Log wall changes
+    // Log wall changes + adaptive poll interval
     const stateKey = `${mm.market.id}-${tokenIndex}`;
     const prev = this.prevWallState.get(stateKey);
+    const changeThreshold = prev ? prev.wall / 10 : 0; // wallSize/10 = significant change
     const wallChanged = prev && (
-      Math.abs(prev.wall - wallAbove) > prev.wall * 0.2 ||
+      Math.abs(prev.wall - wallAbove) > changeThreshold ||
       Math.abs(prev.price - wallTopPrice) >= 0.01
     );
+
+    // Adaptive poll: speed up on change (500ms steps), slow down on stability (1s steps after 3 stable)
+    const prevPollMs = prev?.pollMs ?? LpRewardsEngine.WALL_POLL_DEFAULT_MS;
+    let newPollMs = prevPollMs;
+    let newStableCount = prev?.stableCount ?? 0;
+    if (wallChanged) {
+      newStableCount = 0;
+      newPollMs = Math.max(prevPollMs - 500, LpRewardsEngine.WALL_POLL_MIN_MS); // step down 500ms
+    } else {
+      newStableCount = (prev?.stableCount ?? 0) + 1;
+      if (newStableCount >= 3) {
+        // 3 consecutive stable checks → slow down by 1s, up to max
+        newPollMs = Math.min(prevPollMs + 1_000, LpRewardsEngine.WALL_POLL_MAX_MS);
+      }
+    }
+
     if (wallChanged) {
       const dir = wallAbove > prev!.wall ? '↑' : '↓';
-      this.log('info', `WALL ${dir}: ${mm.market.slug} ${side} $${prev!.wall.toFixed(0)}→$${wallAbove.toFixed(0)} (order@${highestLpPrice.toFixed(2)}, threshold=$${dangerThreshold.toFixed(0)})`);
+      this.log('info', `WALL ${dir}: ${mm.market.slug} ${side} $${prev!.wall.toFixed(0)}→$${wallAbove.toFixed(0)} (order@${highestLpPrice.toFixed(2)}, threshold=$${dangerThreshold.toFixed(0)}) [poll=${(prevPollMs / 1000).toFixed(1)}s→${(newPollMs / 1000).toFixed(1)}s]`);
     }
-    this.prevWallState.set(stateKey, { wall: wallAbove, price: wallTopPrice });
+    if (newPollMs !== prevPollMs && !wallChanged) {
+      this.log('info', `POLL ${newPollMs > prevPollMs ? '▲' : '▼'}: ${mm.market.slug} ${side} ${(prevPollMs / 1000).toFixed(1)}s→${(newPollMs / 1000).toFixed(1)}s (stable×${newStableCount})`);
+    }
+    this.prevWallState.set(stateKey, { wall: wallAbove, price: wallTopPrice, stableCount: newStableCount, pollMs: newPollMs });
 
     // 1. Wall collapsed → cancel immediately
     if (wallAbove < dangerThreshold) {
@@ -1180,6 +1220,9 @@ class LpRewardsEngine {
         const batch = candidates.slice(i, i + LpRewardsEngine.BATCH_SIZE);
         const results = await Promise.allSettled(
           batch.map(async (eff) => {
+            // maxSpread=1¢: only 1 price level (midpoint), no wall protection → skip
+            if (eff.market.rewardsMaxSpread <= 1) return null;
+
             const isTightSpread = this.config.allowTightSpread && eff.market.rewardsMaxSpread <= 2;
 
             // Fetch YES + NO books in parallel
@@ -1192,22 +1235,29 @@ class LpRewardsEngine {
             const noBook = noRes.status === 'fulfilled' ? noRes.value : null;
             if (!yesBook) return null;
 
-            const yesWall = this.findWallPrice(yesBook.bids ?? [], eff.market.midpoint, eff.market.rewardsMaxSpread, dynamicWallSize);
-            if (!yesWall && !isTightSpread) return null;
-
-            if (yesWall) {
-              const yesDistCents = (eff.market.midpoint - yesWall.price) * 100;
-              if (yesDistCents > eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO && !isTightSpread) return null;
+            // Tight spread: require at least one side with $5+ wall value
+            if (isTightSpread) {
+              const yesWallValue = this.getTotalWallValue(yesBook.bids ?? [], eff.market.midpoint, eff.market.rewardsMaxSpread);
+              const noWallValue = noBook
+                ? this.getTotalWallValue(noBook.bids ?? [], 1 - eff.market.midpoint, eff.market.rewardsMaxSpread)
+                : 0;
+              if (yesWallValue < 5 && noWallValue < 5) return null;
+              return eff;
             }
+
+            // Normal markets: require wall meeting minWall threshold
+            const yesWall = this.findWallPrice(yesBook.bids ?? [], eff.market.midpoint, eff.market.rewardsMaxSpread, dynamicWallSize);
+            if (!yesWall) return null;
+
+            const yesDistCents = (eff.market.midpoint - yesWall.price) * 100;
+            if (yesDistCents > eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO) return null;
 
             if (this.config.twoSided && noBook) {
               const noMid = 1 - eff.market.midpoint;
               const noWall = this.findWallPrice(noBook.bids ?? [], noMid, eff.market.rewardsMaxSpread, dynamicWallSize);
-              if (!noWall && !isTightSpread) return null;
-              if (noWall) {
-                const noDistCents = (noMid - noWall.price) * 100;
-                if (noDistCents > eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO && !isTightSpread) return null;
-              }
+              if (!noWall) return null;
+              const noDistCents = (noMid - noWall.price) * 100;
+              if (noDistCents > eff.market.rewardsMaxSpread * MAX_SPREAD_RATIO) return null;
             }
 
             return eff;
@@ -1475,6 +1525,27 @@ class LpRewardsEngine {
     return null;
   }
 
+  /**
+   * Sum total $ value of bids within reward zone.
+   * Used for tight-spread markets to compare wall sizes between YES/NO sides.
+   */
+  private getTotalWallValue(
+    bids: Array<{ price: string; size: string }>,
+    midpoint: number,
+    maxSpreadCents: number,
+  ): number {
+    const minPrice = midpoint - maxSpreadCents / 100;
+    let total = 0;
+    for (const b of bids) {
+      const price = parseFloat(b.price);
+      const size = parseFloat(b.size);
+      if (price > minPrice && price < midpoint && size > 0) {
+        total += price * size;
+      }
+    }
+    return total;
+  }
+
   private async requoteMarket(mm: ManagedMarket) {
     if (!this.profile) return;
 
@@ -1514,7 +1585,9 @@ class LpRewardsEngine {
     // Skip extreme midpoints
     if (liveMid < MIN_MIDPOINT || liveMid > MAX_MIDPOINT) return;
 
-    // Skip markets where maxSpread is too small (unless tight spread allowed)
+    // Skip markets where maxSpread is too small
+    // maxSpread=1¢: only 1 price level possible (= midpoint itself), no wall protection possible → always skip
+    if (maxSpread <= 1) return;
     const isTightAllowed = this.config.allowTightSpread && maxSpread <= 2;
     if (maxSpread <= this.config.minSpreadCents && !isTightAllowed) return;
 
@@ -1539,6 +1612,23 @@ class LpRewardsEngine {
       this.log('info', `${market.slug}: no No wall — skipping`);
       await this.cancelLpOrders(mm);
       return;
+    }
+
+    // For tight-spread markets: compare walls, bigger side goes first (balance naturally blocks 2nd side)
+    let tightPreferYes = true; // default: YES first
+    if (isTightSpread) {
+      const yesWallValue = this.getTotalWallValue(yesBook.bids ?? [], liveMid, maxSpread);
+      const noWallValue = this.config.twoSided
+        ? this.getTotalWallValue(noBook.bids ?? [], noMid, maxSpread)
+        : 0;
+      const TIGHT_MIN_WALL = 5; // $5 minimum
+      if (yesWallValue < TIGHT_MIN_WALL && noWallValue < TIGHT_MIN_WALL) {
+        this.log('info', `${market.slug}: tight — both walls too thin (Yes=$${yesWallValue.toFixed(0)}, No=$${noWallValue.toFixed(0)}) — skipping`);
+        await this.cancelLpOrders(mm);
+        return;
+      }
+      tightPreferYes = yesWallValue >= noWallValue;
+      this.log('info', `${market.slug}: tight — ${tightPreferYes ? 'Yes' : 'No'} wall bigger ($${tightPreferYes ? yesWallValue.toFixed(0) : noWallValue.toFixed(0)} vs $${tightPreferYes ? noWallValue.toFixed(0) : yesWallValue.toFixed(0)}) — ordering ${tightPreferYes ? 'Yes' : 'No'} first`);
     }
 
     // For tight-spread markets: place at maxSpread edge
@@ -1595,64 +1685,77 @@ class LpRewardsEngine {
 
     const newOrders: ActiveOrder[] = [...mm.orders]; // Keep hedge orders
 
-    // Interleave YES and NO: place YES[0], NO[0], YES[1], NO[1], ...
-    // This maximizes Q-score early (both sides covered from first orders)
-    const maxLen = Math.max(yesLadder.length, noLadder.length);
+    // Interleave sides: for tight spread, bigger wall side goes first (balance naturally blocks 2nd).
+    // For normal markets, YES first then NO interleaved.
+    type LadderRung = { tokenIndex: number; tokenId: string; price: number; mid: number; wallInfo: typeof yesWall };
+    const firstLadder: LadderRung[] = [];
+    const secondLadder: LadderRung[] = [];
+
+    const yesRungs: LadderRung[] = yesLadder.map((p) => ({
+      tokenIndex: 0, tokenId: market.clobTokenIds[0], price: p, mid: liveMid, wallInfo: yesWall,
+    }));
+    const noRungs: LadderRung[] = noLadder.map((p) => ({
+      tokenIndex: 1, tokenId: market.clobTokenIds[1], price: p, mid: noMid, wallInfo: noWall,
+    }));
+
+    if (isTightSpread && !tightPreferYes) {
+      firstLadder.push(...noRungs);
+      secondLadder.push(...yesRungs);
+    } else {
+      firstLadder.push(...yesRungs);
+      secondLadder.push(...noRungs);
+    }
+
+    const maxLen = Math.max(firstLadder.length, secondLadder.length);
     let orderIdx = 0;
     for (let li = 0; li < maxLen; li++) {
-      // YES rung
-      if (li < yesLadder.length) {
+      // First side rung
+      if (li < firstLadder.length) {
+        const rung = firstLadder[li];
         if (orderIdx > 0) await new Promise((r) => setTimeout(r, 100));
-        const price = yesLadder[li];
-        const dist = (liveMid - price) * 100;
-        const size = Math.max(rawMinSize, Math.floor(capitalPerRung / price));
+        const dist = (rung.mid - rung.price) * 100;
+        const size = Math.max(rawMinSize, Math.floor(capitalPerRung / rung.price));
+        const sideName = rung.tokenIndex === 0 ? 'Yes' : 'No';
         try {
           const result = await placeProfileOrder(this.profile, {
-            tokenId: market.clobTokenIds[0],
-            side: 'BUY',
-            price,
-            size,
-            postOnly: true,
+            tokenId: rung.tokenId, side: 'BUY', price: rung.price, size, postOnly: true,
           });
           const orderId = (result as any)?.orderID ?? (result as any)?.id ?? 'unknown';
           newOrders.push({
-            orderId, tokenId: market.clobTokenIds[0], tokenIndex: 0,
-            side: 'BUY', price, size,
+            orderId, tokenId: rung.tokenId, tokenIndex: rung.tokenIndex,
+            side: 'BUY', price: rung.price, size,
             originalSize: size, marketId: market.id, purpose: 'lp',
           });
-          this.log('trade', `${market.slug} BUY Yes @${price.toFixed(2)} x${size} ($${(price * size).toFixed(0)}) (${dist.toFixed(1)}¢) [wall=$${yesWall?.wallSize.toFixed(0) ?? '?'}] [id=${orderId.slice(0, 10)}]`);
+          this.log('trade', `${market.slug} BUY ${sideName} @${rung.price.toFixed(2)} x${size} ($${(rung.price * size).toFixed(0)}) (${dist.toFixed(1)}¢) [wall=$${rung.wallInfo?.wallSize.toFixed(0) ?? '?'}] [id=${orderId.slice(0, 10)}]`);
           orderIdx++;
         } catch (err: any) {
-          this.log('error', `${market.slug} BUY Yes @${price.toFixed(2)}: ${err.message}`);
+          this.log('error', `${market.slug} BUY ${sideName} @${rung.price.toFixed(2)}: ${err.message}`);
           break; // Balance exhausted
         }
       }
 
-      // NO rung
-      if (li < noLadder.length) {
-        const price = noLadder[li];
-        const dist = (noMid - price) * 100;
+      // Second side rung
+      if (li < secondLadder.length) {
+        const rung = secondLadder[li];
+        const dist = (rung.mid - rung.price) * 100;
         if (dist <= maxSpread) {
           if (orderIdx > 0) await new Promise((r) => setTimeout(r, 100));
-          const size = Math.max(rawMinSize, Math.floor(capitalPerRung / price));
+          const size = Math.max(rawMinSize, Math.floor(capitalPerRung / rung.price));
+          const sideName = rung.tokenIndex === 0 ? 'Yes' : 'No';
           try {
             const result = await placeProfileOrder(this.profile, {
-              tokenId: market.clobTokenIds[1],
-              side: 'BUY',
-              price,
-              size,
-              postOnly: true,
+              tokenId: rung.tokenId, side: 'BUY', price: rung.price, size, postOnly: true,
             });
             const orderId = (result as any)?.orderID ?? (result as any)?.id ?? 'unknown';
             newOrders.push({
-              orderId, tokenId: market.clobTokenIds[1], tokenIndex: 1,
-              side: 'BUY', price, size,
+              orderId, tokenId: rung.tokenId, tokenIndex: rung.tokenIndex,
+              side: 'BUY', price: rung.price, size,
               originalSize: size, marketId: market.id, purpose: 'lp',
             });
-            this.log('trade', `${market.slug} BUY No @${price.toFixed(2)} x${size} ($${(price * size).toFixed(0)}) (${dist.toFixed(1)}¢) [wall=$${noWall?.wallSize.toFixed(0) ?? '?'}] [id=${orderId.slice(0, 10)}]`);
+            this.log('trade', `${market.slug} BUY ${sideName} @${rung.price.toFixed(2)} x${size} ($${(rung.price * size).toFixed(0)}) (${dist.toFixed(1)}¢) [wall=$${rung.wallInfo?.wallSize.toFixed(0) ?? '?'}] [id=${orderId.slice(0, 10)}]`);
             orderIdx++;
           } catch (err: any) {
-            this.log('error', `${market.slug} BUY No @${price.toFixed(2)}: ${err.message}`);
+            this.log('error', `${market.slug} BUY ${sideName} @${rung.price.toFixed(2)}: ${err.message}`);
             break; // Balance exhausted
           }
         }

@@ -3,63 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { Chip, Spinner, Select, SelectItem } from '@heroui/react';
 import { useProfileStore } from '@/store/useProfileStore';
-import { DepthGrid, WallBar } from '@/components/DepthGrid';
-
-interface MarketRow {
-  id: string;
-  question: string;
-  slug: string;
-  midpoint: number;
-  spread: number;
-  liquidity: number;
-  volume24hr?: number;
-  rewardsMaxSpread: number;
-  rewardsMinSize: number;
-  qScorePerDollar: number;
-  qScore: number;
-  rewardRatio: number;
-  bestBid?: number;
-  bestAsk?: number;
-  eventTitle?: string;
-  outcomes?: string[];
-  outcomePrices?: number[];
-  rewardsDailyRate?: number;
-  competitiveness?: number;
-  estDailyReward?: number;
-  minCapital?: number;
-  roiAtMin?: number;
-  roiAtConfig?: number;
-  wallYes?: number;
-  wallNo?: number;
-  yesDistCents?: number;
-  noDistCents?: number;
-  daysToExpiry?: number;
-  clobTokenIds?: string[];
-  conditionId?: string;
-  endDate?: string;
-  negRisk?: boolean;
-}
-
-interface BotStatus {
-  marketId: string;
-  question: string;
-  slug: string;
-  running: boolean;
-  capital: number;
-  dominantSide: string;
-  midpoint: number;
-  orders: number;
-  positions: number;
-  wallSize: number;
-  orderPrice: number;
-  pnl: number;
-  fills: number;
-  lastUpdate: number;
-  yesPrice: number;
-  noPrice: number;
-  yesWall: number;
-  noWall: number;
-}
+import { DepthGrid } from '@/components/DepthGrid';
 
 interface EngineMarket {
   id: string;
@@ -84,6 +28,24 @@ interface EngineMarket {
   rewardsMaxSpread: number;
   depthYes?: Array<{ price: number; size: number; isMyOrder: boolean }>;
   depthNo?: Array<{ price: number; size: number; isMyOrder: boolean }>;
+  pollIntervalMs?: number;
+}
+
+/** Lightweight market from scan API (used when engine is not running) */
+interface ScannedMarket {
+  id: string;
+  question: string;
+  slug: string;
+  midpoint: number;
+  rewardsDailyRate: number;
+  rewardsMaxSpread: number;
+  liquidity: number;
+  wallYes: number;
+  wallNo: number;
+  roiAtMin: number;
+  estDailyReward: number;
+  daysToExpiry: number;
+  eventTitle?: string;
 }
 
 interface EngineStatus {
@@ -108,59 +70,57 @@ interface LogLine {
   timestamp: number;
 }
 
-type TabType = 'scan' | 'engine';
-
 export default function LpRewardsPage() {
-  const [tab, setTab] = useState<TabType>('scan');
-  const [scannedMarkets, setScannedMarkets] = useState<MarketRow[]>([]);
-  const [botStatuses, setBotStatuses] = useState<Map<string, BotStatus>>(new Map());
-  const [botLogs, setBotLogs] = useState<LogLine[]>([]);
+  const [scannedMarkets, setScannedMarkets] = useState<ScannedMarket[]>([]);
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [engineLogs, setEngineLogs] = useState<LogLine[]>([]);
   const [loading, setLoading] = useState(true);
-  const [scanning, setScanning] = useState(false);
   const [engineStarting, setEngineStarting] = useState(false);
   const [maxMarketsInput, setMaxMarketsInput] = useState(50);
   const [allowTightSpread, setAllowTightSpread] = useState(false);
   const [profileId, setProfileId] = useState('cmlmpyou700bn0y09gh4fem6y');
-  const [capitalInput, setCapitalInput] = useState(50);
-  const [minWallInput, setMinWallInput] = useState(500);
-  const [sortBy, setSortBy] = useState<'roiAtMin' | 'rewardsDailyRate' | 'competitiveness' | 'liquidity'>('roiAtMin');
   const [standaloneBalance, setStandaloneBalance] = useState<number | null>(null);
-  const [perMarketCapital, setPerMarketCapital] = useState<Map<string, number>>(new Map());
-  const [botLoading, setBotLoading] = useState<Set<string>>(new Set());
   const { profiles, fetchProfiles } = useProfileStore();
 
-  // Fetch everything: bots + engine
-  const fetchAll = useCallback(async () => {
+  const isEngineRunning = engineStatus?.running ?? false;
+
+  // Fetch engine status + logs
+  const fetchEngine = useCallback(async () => {
     try {
-      const [botsRes, engineRes] = await Promise.all([
-        fetch('/api/lp?bots=true&limit=200'),
-        fetch('/api/lp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'status' }) }),
-      ]);
-      const botsData = await botsRes.json();
-      const engineData = await engineRes.json();
-
-      const map = new Map<string, BotStatus>();
-      for (const b of (botsData.bots ?? [])) map.set(b.marketId, b);
-      setBotStatuses(map);
-      setBotLogs(botsData.logs ?? []);
-
-      if (engineData.engine) setEngineStatus(engineData.engine);
-      if (engineData.logs) setEngineLogs(engineData.logs);
+      const res = await fetch('/api/lp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'status' }),
+      });
+      const data = await res.json();
+      if (data.engine) setEngineStatus(data.engine);
+      if (data.logs) setEngineLogs(data.logs);
     } catch { /* ignore */ }
     setLoading(false);
   }, []);
 
-  const handleScan = useCallback(async () => {
-    setScanning(true);
+  // Fetch scanned markets (used when engine is NOT running)
+  const fetchScannedMarkets = useCallback(async () => {
     try {
-      const res = await fetch(`/api/lp?scan=true&capital=${capitalInput}&wall=${minWallInput}`);
+      const res = await fetch('/api/lp?scan=true&capital=50&wall=500&topN=100');
       const data = await res.json();
-      setScannedMarkets(data.ranked ?? []);
+      setScannedMarkets((data.ranked ?? []).map((m: any) => ({
+        id: m.id,
+        question: m.question,
+        slug: m.slug,
+        midpoint: m.midpoint,
+        rewardsDailyRate: m.rewardsDailyRate ?? 0,
+        rewardsMaxSpread: m.rewardsMaxSpread,
+        liquidity: m.liquidity,
+        wallYes: m.wallYes ?? 0,
+        wallNo: m.wallNo ?? 0,
+        roiAtMin: m.roiAtMin ?? 0,
+        estDailyReward: m.estDailyReward ?? 0,
+        daysToExpiry: m.daysToExpiry ?? 0,
+        eventTitle: m.eventTitle,
+      })));
     } catch { /* ignore */ }
-    setScanning(false);
-  }, [capitalInput, minWallInput]);
+  }, []);
 
   const fetchBalance = useCallback(async () => {
     if (!profileId) return;
@@ -173,12 +133,13 @@ export default function LpRewardsPage() {
 
   useEffect(() => {
     fetchProfiles();
-    fetchAll();
-    handleScan();
+    fetchEngine();
+    fetchScannedMarkets();
     fetchBalance();
-    const interval = setInterval(fetchAll, 5000);
-    return () => clearInterval(interval);
-  }, [fetchProfiles, fetchAll, handleScan, fetchBalance]);
+    // Poll engine status every 5s
+    const engineInterval = setInterval(fetchEngine, 5000);
+    return () => clearInterval(engineInterval);
+  }, [fetchProfiles, fetchEngine, fetchScannedMarkets, fetchBalance]);
 
   // Engine start/stop
   const handleEngineStart = async () => {
@@ -192,7 +153,6 @@ export default function LpRewardsPage() {
       });
       const data = await res.json();
       if (data.status) setEngineStatus(data.status);
-      setTab('engine');
     } catch { /* ignore */ }
     setEngineStarting(false);
   };
@@ -205,54 +165,40 @@ export default function LpRewardsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'stop' }),
       });
-      await fetchAll();
+      await fetchEngine();
+      // Refresh scanned markets after engine stops
+      fetchScannedMarkets();
     } catch { /* ignore */ }
     setEngineStarting(false);
   };
 
-  // Per-market bot start/stop
-  const handleStartBot = async (market: MarketRow) => {
-    if (!profileId) return;
-    const capital = perMarketCapital.get(market.id) ?? market.rewardsMinSize ?? capitalInput;
-    setBotLoading((prev) => new Set(prev).add(market.id));
-    try {
-      await fetch('/api/lp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'start-bot', marketData: market, profileId, capital }),
-      });
-      await fetchAll();
-    } catch { /* ignore */ }
-    setBotLoading((prev) => { const s = new Set(prev); s.delete(market.id); return s; });
-  };
+  const reversedLogs = [...engineLogs].reverse();
 
-  const handleStopBot = async (marketId: string) => {
-    setBotLoading((prev) => new Set(prev).add(marketId));
-    try {
-      await fetch('/api/lp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'stop-bot', marketId }),
-      });
-      await fetchAll();
-    } catch { /* ignore */ }
-    setBotLoading((prev) => { const s = new Set(prev); s.delete(marketId); return s; });
-  };
-
-  const sortedMarkets = [...scannedMarkets].sort((a, b) => {
-    if (sortBy === 'roiAtMin') return (b.roiAtMin ?? 0) - (a.roiAtMin ?? 0);
-    if (sortBy === 'rewardsDailyRate') return (b.rewardsDailyRate ?? 0) - (a.rewardsDailyRate ?? 0);
-    if (sortBy === 'competitiveness') return (a.competitiveness ?? 999999) - (b.competitiveness ?? 999999);
-    return (b.liquidity ?? 0) - (a.liquidity ?? 0);
-  });
-
-  const activeBots = Array.from(botStatuses.values()).filter((b) => b.running);
-  const totalPnl = activeBots.reduce((s, b) => s + b.pnl, 0);
-  const totalFills = activeBots.reduce((s, b) => s + b.fills, 0);
-  const isEngineRunning = engineStatus?.running ?? false;
-
-  const logs = tab === 'engine' ? engineLogs : botLogs;
-  const reversedLogs = [...logs].reverse();
+  // Show engine markets when running, scanned markets otherwise
+  const displayMarkets: EngineMarket[] = isEngineRunning && engineStatus
+    ? engineStatus.markets
+    : scannedMarkets.map((m) => ({
+        id: m.id,
+        question: m.question,
+        slug: m.slug,
+        midpoint: m.midpoint,
+        allocatedCapital: 0,
+        activeOrders: 0,
+        heldPositions: 0,
+        lpDeployed: 0,
+        rewardsDailyRate: m.rewardsDailyRate,
+        estDailyReward: m.estDailyReward,
+        roiAtMin: m.roiAtMin,
+        inventorySkew: 0,
+        daysToExpiry: m.daysToExpiry,
+        liveBidYes: 0,
+        liveBidNo: 0,
+        myBidYes: 0,
+        myBidNo: 0,
+        wallYes: m.wallYes,
+        wallNo: m.wallNo,
+        rewardsMaxSpread: m.rewardsMaxSpread,
+      }));
 
   if (loading) {
     return <div className="flex items-center justify-center h-64"><Spinner size="lg" /></div>;
@@ -266,34 +212,8 @@ export default function LpRewardsPage() {
         <div className="flex items-center justify-between flex-shrink-0">
           <div className="flex items-center gap-3">
             <h1 className="text-xl font-bold text-gray-900 dark:text-white">LP Rewards</h1>
-            {/* Tab switcher */}
-            <div className="flex rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
-              <button
-                onClick={() => setTab('scan')}
-                className={`px-3 py-1 text-xs font-medium ${tab === 'scan' ? 'bg-blue-500 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-500'}`}
-              >
-                Scan
-              </button>
-              <button
-                onClick={() => setTab('engine')}
-                className={`px-3 py-1 text-xs font-medium ${tab === 'engine' ? 'bg-blue-500 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-500'}`}
-              >
-                Auto Engine
-              </button>
-            </div>
             {isEngineRunning && (
               <Chip size="sm" color="success" variant="dot">Engine ON</Chip>
-            )}
-            {activeBots.length > 0 && (
-              <Chip size="sm" color="success" variant="flat">{activeBots.length} bots</Chip>
-            )}
-            {totalFills > 0 && (
-              <Chip size="sm" color="warning" variant="flat">{totalFills} fills</Chip>
-            )}
-            {totalPnl !== 0 && (
-              <Chip size="sm" color={totalPnl >= 0 ? 'success' : 'danger'} variant="flat">
-                PnL: ${totalPnl.toFixed(2)}
-              </Chip>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -317,263 +237,94 @@ export default function LpRewardsPage() {
           </div>
         </div>
 
-        {/* ── Scan Tab ── */}
-        {tab === 'scan' && (
-          <>
-            {/* Config row */}
-            <div className="flex items-center gap-4 flex-shrink-0 bg-gray-100 dark:bg-gray-800 rounded-lg px-3 py-2">
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs text-gray-500">Capital $:</span>
-                <input type="number" value={capitalInput} onChange={(e) => setCapitalInput(Number(e.target.value))}
-                  className="w-14 px-1 py-0.5 text-xs bg-white dark:bg-gray-900 rounded text-center" min={1} max={10000} />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs text-gray-500">Wall $:</span>
-                <input type="number" value={minWallInput} onChange={(e) => setMinWallInput(Number(e.target.value))}
-                  className="w-16 px-1 py-0.5 text-xs bg-white dark:bg-gray-900 rounded text-center" min={10} max={50000} step={10} />
-              </div>
-              <button onClick={handleScan} disabled={scanning}
-                className="px-3 py-1.5 text-xs rounded-lg bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50">
-                {scanning ? 'Scanning...' : 'Scan'}
-              </button>
-              <span className="text-[10px] text-gray-400 ml-auto">
-                Wall Rider | Two-sided | Post-only hedge +1c | Force exit 60s
+        {/* Engine controls */}
+        <div className="flex items-center gap-4 flex-shrink-0 bg-gray-100 dark:bg-gray-800 rounded-lg px-3 py-2">
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-gray-500">Max:</span>
+            <input type="number" value={maxMarketsInput} onChange={(e) => setMaxMarketsInput(Number(e.target.value))}
+              className="w-14 px-1 py-0.5 text-xs bg-white dark:bg-gray-900 rounded text-center" min={1} max={200} />
+          </div>
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <input type="checkbox" checked={allowTightSpread} onChange={(e) => setAllowTightSpread(e.target.checked)}
+              className="w-3.5 h-3.5 rounded" />
+            <span className="text-xs text-gray-500">Tight Spread</span>
+          </label>
+          <button
+            onClick={isEngineRunning ? handleEngineStop : handleEngineStart}
+            disabled={engineStarting}
+            className={`px-4 py-2 text-sm rounded-lg font-bold transition-colors ${
+              engineStarting ? 'opacity-50 cursor-wait' :
+              isEngineRunning
+                ? 'bg-red-500 text-white hover:bg-red-600'
+                : 'bg-green-500 text-white hover:bg-green-600'
+            }`}>
+            {engineStarting ? '...' : isEngineRunning ? 'Stop Engine' : 'Start Engine'}
+          </button>
+          {isEngineRunning && engineStatus && (
+            <div className="flex items-center gap-4 text-xs">
+              <span className="text-gray-400">
+                Markets: <span className="text-white font-mono">{engineStatus.managedMarkets}</span>
               </span>
-            </div>
-
-            {/* Sort bar */}
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <span className="text-xs text-gray-500">Sort:</span>
-              {(['roiAtMin', 'rewardsDailyRate', 'competitiveness', 'liquidity'] as const).map((key) => (
-                <button key={key} onClick={() => setSortBy(key)}
-                  className={`text-xs px-2 py-0.5 rounded ${sortBy === key ? 'bg-blue-500 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400'}`}>
-                  {key === 'roiAtMin' ? 'ROI/day' : key === 'rewardsDailyRate' ? '$/day' : key === 'competitiveness' ? 'Competition' : 'Liquidity'}
-                </button>
-              ))}
-              <span className="text-xs text-gray-500 ml-2">{sortedMarkets.length} markets</span>
-              {sortedMarkets.length > 0 && (
-                <span className="text-xs text-green-400 font-mono">
-                  est +${sortedMarkets.reduce((s, m) => s + (m.estDailyReward ?? 0), 0).toFixed(2)}/day
+              <span className="text-gray-400">
+                Deployed: <span className="text-white font-mono">${engineStatus.totalLpDeployed.toFixed(0)}</span>
+              </span>
+              <span className="text-gray-400">
+                Orders: <span className="text-white font-mono">{engineStatus.totalActiveOrders}</span>
+              </span>
+              <span className="text-green-400 font-mono">
+                est +${engineStatus.totalEstDailyReward.toFixed(2)}/day
+              </span>
+              {engineStatus.dailyEarnings?.totalEarnings != null && (
+                <span className="text-purple-400 font-mono">
+                  earned ${typeof engineStatus.dailyEarnings.totalEarnings === 'number'
+                    ? `$${engineStatus.dailyEarnings.totalEarnings.toFixed(2)}`
+                    : `$${parseFloat(engineStatus.dailyEarnings.totalEarnings?.amount ?? engineStatus.dailyEarnings.totalEarnings ?? '0').toFixed(2)}`}
                 </span>
               )}
             </div>
+          )}
+          {!isEngineRunning && scannedMarkets.length > 0 && (
+            <span className="text-xs text-gray-500">{scannedMarkets.length} markets scanned</span>
+          )}
+        </div>
 
-            {/* Markets Table */}
-            <div className="flex-1 min-h-0 overflow-y-auto">
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-gray-50 dark:bg-gray-900 z-10">
-                  <tr className="text-left text-gray-500">
-                    <th className="px-2 py-1.5 font-medium">#</th>
-                    <th className="px-2 py-1.5 font-medium min-w-[200px]">Market</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Mid</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Liq</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Comp</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Wall</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Rate</th>
-                    <th className="px-2 py-1.5 font-medium text-right">ROI/d</th>
-                    <th className="px-2 py-1.5 font-medium text-right">$/day</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Dist</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Exp</th>
-                    <th className="px-2 py-1.5 font-medium text-center">Bot</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedMarkets.map((m, i) => {
-                    const bot = botStatuses.get(m.id);
-                    const isRunning = bot?.running ?? false;
-                    const isLoading = botLoading.has(m.id);
-                    const comp = m.competitiveness ?? 0;
-
-                    return (
-                      <tr key={m.id}
-                        className={`border-t border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50 ${isRunning ? 'bg-green-900/10' : ''}`}>
-                        <td className="px-2 py-1.5 text-gray-400">{i + 1}</td>
-                        <td className="px-2 py-1.5">
-                          <div className="flex flex-col">
-                            <a href={`https://polymarket.com/event/${m.slug}`} target="_blank" rel="noopener noreferrer"
-                              className="font-medium text-gray-900 dark:text-white truncate max-w-[250px] hover:text-blue-500 hover:underline">
-                              {m.question}
-                            </a>
-                            {m.eventTitle && <span className="text-[10px] text-gray-400 truncate max-w-[250px]">{m.eventTitle}</span>}
-                            {isRunning && bot && (
-                              <span className="text-[10px] text-green-400">
-                                {bot.orders} ord | {bot.fills} fills
-                                {bot.yesPrice > 0 && ` | Y@${bot.yesPrice.toFixed(2)}`}
-                                {bot.noPrice > 0 && ` | N@${bot.noPrice.toFixed(2)}`}
-                                {` | wall Y$${(bot.yesWall ?? 0).toFixed(0)} N$${(bot.noWall ?? 0).toFixed(0)}`}
-                                {bot.pnl !== 0 && ` | pnl=$${bot.pnl.toFixed(2)}`}
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="px-2 py-1.5 text-right font-mono">{(m.midpoint * 100).toFixed(0)}c</td>
-                        <td className="px-2 py-1.5 text-right font-mono">${formatCompact(m.liquidity)}</td>
-                        <td className="px-2 py-1.5 text-right font-mono">
-                          {comp > 0 ? (
-                            <span className={comp < 20 ? 'text-green-400' : comp < 100 ? 'text-yellow-400' : 'text-gray-500'}>
-                              {comp.toFixed(0)}
-                            </span>
-                          ) : <span className="text-gray-600">—</span>}
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <WallBar label="Y" mid={m.midpoint} wallSize={m.wallYes ?? 0} maxSpread={m.rewardsMaxSpread} />
-                          <WallBar label="N" mid={1 - m.midpoint} wallSize={m.wallNo ?? 0} maxSpread={m.rewardsMaxSpread} />
-                        </td>
-                        <td className="px-2 py-1.5 text-right font-mono text-yellow-400">
-                          {(m.rewardsDailyRate ?? 0) > 0 ? `$${m.rewardsDailyRate!.toFixed(0)}` : '—'}
-                        </td>
-                        <td className="px-2 py-1.5 text-right font-mono">
-                          {(m.roiAtMin ?? 0) > 0 ? (
-                            <span className={(m.roiAtMin ?? 0) >= 1 ? 'text-green-400' : (m.roiAtMin ?? 0) >= 0.1 ? 'text-yellow-400' : 'text-gray-500'}>
-                              {(m.roiAtMin ?? 0).toFixed(2)}%
-                            </span>
-                          ) : '—'}
-                        </td>
-                        <td className="px-2 py-1.5 text-right font-mono">
-                          {(m.estDailyReward ?? 0) > 0 ? <span className="text-green-400">+${m.estDailyReward!.toFixed(2)}</span> : '—'}
-                        </td>
-                        <td className="px-2 py-1.5 text-right font-mono text-gray-400">
-                          {(m.yesDistCents ?? -1) >= 0 ? (
-                            <span className={(m.yesDistCents ?? 99) <= 2 ? 'text-green-400' : (m.yesDistCents ?? 99) <= 3 ? 'text-yellow-400' : 'text-red-400'}>
-                              {(m.yesDistCents ?? 0).toFixed(1)}c
-                            </span>
-                          ) : '—'}
-                        </td>
-                        <td className="px-2 py-1.5 text-right font-mono">
-                          {(m.daysToExpiry ?? 0) > 0 ? (
-                            <span className={(m.daysToExpiry ?? 0) < 1 ? 'text-red-400' : (m.daysToExpiry ?? 0) < 7 ? 'text-yellow-400' : 'text-gray-400'}>
-                              {(m.daysToExpiry ?? 0) < 1 ? `${((m.daysToExpiry ?? 0) * 24).toFixed(0)}h` : `${(m.daysToExpiry ?? 0).toFixed(0)}d`}
-                            </span>
-                          ) : '—'}
-                        </td>
-                        <td className="px-2 py-2 text-center">
-                          <div className="flex items-center justify-center gap-1">
-                            {!isRunning && (
-                              <input type="number"
-                                value={perMarketCapital.get(m.id) ?? m.rewardsMinSize ?? capitalInput}
-                                onChange={(e) => setPerMarketCapital((prev) => new Map(prev).set(m.id, Number(e.target.value)))}
-                                className="w-12 px-1 py-0.5 text-[11px] bg-white dark:bg-gray-900 rounded text-center font-mono"
-                                min={1} max={10000} />
-                            )}
-                            <button
-                              onClick={() => isRunning ? handleStopBot(m.id) : handleStartBot(m)}
-                              disabled={isLoading || !profileId}
-                              className={`px-2 py-0.5 text-[11px] rounded font-medium transition-colors ${
-                                isLoading ? 'opacity-50 cursor-wait' :
-                                isRunning ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30' : 'bg-green-500/20 text-green-400 hover:bg-green-500/30'
-                              }`}>
-                              {isLoading ? '...' : isRunning ? '■' : '▶'}
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                  {sortedMarkets.length === 0 && (
-                    <tr><td colSpan={12} className="px-2 py-8 text-center text-gray-500">
-                      {scanning ? 'Scanning markets...' : 'No reward markets found. Click Scan.'}
-                    </td></tr>
-                  )}
-                </tbody>
-              </table>
+        {/* Markets table */}
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          {displayMarkets.length > 0 ? (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-gray-50 dark:bg-gray-900 z-10">
+                <tr className="text-left text-gray-500">
+                  <th className="px-2 py-1.5 font-medium">#</th>
+                  <th className="px-2 py-1.5 font-medium min-w-[200px]">Market</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Orders</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Rate</th>
+                  {isEngineRunning && <th className="px-2 py-1.5 font-medium text-right">Poll</th>}
+                  <th className="px-2 py-1.5 font-medium text-center">Orderbook</th>
+                </tr>
+              </thead>
+              <tbody>
+                {displayMarkets.map((m, i) => (
+                  <EngineMarketRow key={m.id} market={m} index={i} showPoll={isEngineRunning} />
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="flex items-center justify-center h-full text-gray-500">
+              {isEngineRunning ? 'Scanning markets...' : 'Loading markets...'}
             </div>
-          </>
-        )}
-
-        {/* ── Engine Tab ── */}
-        {tab === 'engine' && (
-          <>
-            {/* Engine controls */}
-            <div className="flex items-center gap-4 flex-shrink-0 bg-gray-100 dark:bg-gray-800 rounded-lg px-3 py-2">
-              <div className="flex items-center gap-1.5">
-                <span className="text-xs text-gray-500">Max:</span>
-                <input type="number" value={maxMarketsInput} onChange={(e) => setMaxMarketsInput(Number(e.target.value))}
-                  className="w-14 px-1 py-0.5 text-xs bg-white dark:bg-gray-900 rounded text-center" min={1} max={200} />
-              </div>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={allowTightSpread} onChange={(e) => setAllowTightSpread(e.target.checked)}
-                  className="w-3.5 h-3.5 rounded" />
-                <span className="text-xs text-gray-500">1¢ Sports</span>
-              </label>
-              <button
-                onClick={isEngineRunning ? handleEngineStop : handleEngineStart}
-                disabled={engineStarting}
-                className={`px-4 py-2 text-sm rounded-lg font-bold transition-colors ${
-                  engineStarting ? 'opacity-50 cursor-wait' :
-                  isEngineRunning
-                    ? 'bg-red-500 text-white hover:bg-red-600'
-                    : 'bg-green-500 text-white hover:bg-green-600'
-                }`}>
-                {engineStarting ? '...' : isEngineRunning ? 'Stop Engine' : 'Start Engine'}
-              </button>
-              {isEngineRunning && engineStatus && (
-                <div className="flex items-center gap-4 text-xs">
-                  <span className="text-gray-400">
-                    Markets: <span className="text-white font-mono">{engineStatus.managedMarkets}</span>
-                  </span>
-                  <span className="text-gray-400">
-                    Deployed: <span className="text-white font-mono">${engineStatus.totalLpDeployed.toFixed(0)}</span>
-                  </span>
-                  <span className="text-gray-400">
-                    Orders: <span className="text-white font-mono">{engineStatus.totalActiveOrders}</span>
-                  </span>
-                  <span className="text-green-400 font-mono">
-                    est +${engineStatus.totalEstDailyReward.toFixed(2)}/day
-                  </span>
-                  {engineStatus.dailyEarnings?.totalEarnings != null && (
-                    <span className="text-purple-400 font-mono">
-                      earned ${typeof engineStatus.dailyEarnings.totalEarnings === 'number'
-                        ? `$${engineStatus.dailyEarnings.totalEarnings.toFixed(2)}`
-                        : `$${parseFloat(engineStatus.dailyEarnings.totalEarnings?.amount ?? engineStatus.dailyEarnings.totalEarnings ?? '0').toFixed(2)}`}
-                    </span>
-                  )}
-                </div>
-              )}
-              <span className="text-[10px] text-gray-400 ml-auto">
-                Auto: scan 5m | requote 30s | fill check 10s | 40% cash reserve
-              </span>
-            </div>
-
-            {/* Engine managed markets */}
-            <div className="flex-1 min-h-0 overflow-y-auto">
-              {isEngineRunning && engineStatus && engineStatus.markets.length > 0 ? (
-                <table className="w-full text-xs">
-                  <thead className="sticky top-0 bg-gray-50 dark:bg-gray-900 z-10">
-                    <tr className="text-left text-gray-500">
-                      <th className="px-2 py-1.5 font-medium">#</th>
-                      <th className="px-2 py-1.5 font-medium min-w-[200px]">Market</th>
-                      <th className="px-2 py-1.5 font-medium text-right">Orders</th>
-                      <th className="px-2 py-1.5 font-medium text-right">Rate</th>
-                      <th className="px-2 py-1.5 font-medium text-center">Orderbook</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {engineStatus.markets.map((m, i) => (
-                      <EngineMarketRow key={m.id} market={m} index={i} />
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <div className="flex items-center justify-center h-full text-gray-500">
-                  {isEngineRunning ? 'Scanning markets...' : 'Engine is stopped. Click Start Engine to auto-manage LP positions.'}
-                </div>
-              )}
-            </div>
-          </>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Right: Logs */}
       <div className="w-[360px] flex-shrink-0 flex flex-col">
         <div className="flex items-center justify-between mb-2 flex-shrink-0">
-          <h3 className="text-sm font-semibold text-gray-900 dark:text-white">
-            {tab === 'engine' ? 'Engine Logs' : 'Bot Logs'}
-          </h3>
-          <span className="text-[10px] text-gray-500">{logs.length}</span>
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white">Engine Logs</h3>
+          <span className="text-[10px] text-gray-500">{engineLogs.length}</span>
         </div>
         <div className="flex-1 min-h-0 bg-gray-950 rounded-lg p-3 overflow-y-auto font-mono text-[11px] leading-relaxed">
           {reversedLogs.length === 0 ? (
-            <span className="text-gray-600">{tab === 'engine' ? 'Start engine to see logs...' : 'No active bots...'}</span>
+            <span className="text-gray-600">Start engine to see logs...</span>
           ) : (
             reversedLogs.map((log, i) => (
               <div key={`${log.timestamp}-${i}`}
@@ -591,31 +342,8 @@ export default function LpRewardsPage() {
   );
 }
 
-/** Flash cell — highlights when value changes */
-function FlashValue({ value, format, className = '' }: { value: number; format: (v: number) => string; className?: string }) {
-  const prevRef = useRef(value);
-  const [flash, setFlash] = useState<'up' | 'down' | null>(null);
-
-  useEffect(() => {
-    if (Math.abs(value - prevRef.current) > 0.001) {
-      setFlash(value > prevRef.current ? 'up' : 'down');
-      prevRef.current = value;
-      const timer = setTimeout(() => setFlash(null), 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [value]);
-
-  const flashClass = flash === 'up'
-    ? 'animate-flash-green'
-    : flash === 'down'
-      ? 'animate-flash-red'
-      : '';
-
-  return <span className={`${className} ${flashClass} transition-colors duration-500`}>{format(value)}</span>;
-}
-
 /** Engine market row with flash effects on price changes */
-function EngineMarketRow({ market: m, index: i }: { market: EngineMarket; index: number }) {
+function EngineMarketRow({ market: m, index: i, showPoll }: { market: EngineMarket; index: number; showPoll: boolean }) {
   const prevYesBid = useRef(m.myBidYes);
   const prevNoBid = useRef(m.myBidNo);
   const prevWallY = useRef(m.wallYes);
@@ -653,8 +381,11 @@ function EngineMarketRow({ market: m, index: i }: { market: EngineMarket; index:
           {m.question}
         </a>
       </td>
-      <td className="px-2 py-1.5 text-right font-mono">{m.activeOrders}</td>
+      <td className="px-2 py-1.5 text-right font-mono">{m.activeOrders || '-'}</td>
       <td className="px-2 py-1.5 text-right font-mono text-yellow-400">${m.rewardsDailyRate.toFixed(0)}</td>
+      {showPoll && (
+        <td className="px-2 py-1.5 text-right font-mono text-gray-400">{m.pollIntervalMs ? `${(m.pollIntervalMs / 1000).toFixed(0)}s` : '-'}</td>
+      )}
       <td className="px-2 py-1.5 text-center">
         <div className="flex justify-center">
           <DepthGrid mid={m.midpoint} depthYes={m.depthYes ?? []} depthNo={m.depthNo ?? []} wallYes={m.wallYes} wallNo={m.wallNo} maxSpread={m.rewardsMaxSpread} />
@@ -663,7 +394,6 @@ function EngineMarketRow({ market: m, index: i }: { market: EngineMarket; index:
     </tr>
   );
 }
-
 
 function formatCompact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;

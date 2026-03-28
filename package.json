@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "scripts/clear-cache.sh & CACHE_PID=$!; trap \"kill $CACHE_PID 2>/dev/null\" EXIT; next dev",
+    "dev": "scripts/clear-cache.sh & CACHE_PID=$!; trap \"kill $CACHE_PID 2>/dev/null\" EXIT; next dev -p 3030",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
